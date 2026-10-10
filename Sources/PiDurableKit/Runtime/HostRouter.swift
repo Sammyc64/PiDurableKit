@@ -31,6 +31,9 @@ final class HostRouter: Sendable {
         var databases: [Int: any SQLiteDatabase] = [:]
         var transactions: [Int: SQLiteTransaction] = [:]
         var logins: [Int: LoginSession] = [:]
+        var environments: [String: any CustomExecutionEnvironment] = [:]
+        var storages: [Int: any CustomStorage] = [:]
+        var conformanceFactories: [Int: @Sendable () async throws -> JSONValue] = [:]
 
         mutating func makeID() -> Int {
             defer { nextID += 1 }
@@ -133,6 +136,32 @@ final class HostRouter: Sendable {
         }
     }
 
+    /// Makes a Swift execution environment reachable from JavaScript, by its `id`.
+    func register(_ environment: any CustomExecutionEnvironment) {
+        state.withLock { $0.environments[environment.id] = environment }
+    }
+
+    /// Makes a Swift storage reachable from JavaScript.
+    func register(_ storage: any CustomStorage) -> Int {
+        state.withLock { state in
+            let id = state.makeID()
+            state.storages[id] = storage
+            return id
+        }
+    }
+
+    func registerConformanceFactory(_ factory: @escaping @Sendable () async throws -> JSONValue) -> Int {
+        state.withLock { state in
+            let id = state.makeID()
+            state.conformanceFactories[id] = factory
+            return id
+        }
+    }
+
+    func removeConformanceFactory(_ id: Int) {
+        state.withLock { _ = $0.conformanceFactories.removeValue(forKey: id) }
+    }
+
     func registerCommit(_ commit: @escaping Commit) -> Int {
         state.withLock { state in
             let id = state.makeID()
@@ -160,6 +189,7 @@ final class HostRouter: Sendable {
         let result: (any Encodable)? =
             switch method {
             case "tool.execute": try await executeTool(arguments)
+            case "tool.prepareShell": try await prepareShell(arguments)
             case "section.render": try await renderSection(arguments)
             case "hook.beforeTool": try await beforeTool(arguments)
             case "hook.afterTool": try await afterTool(arguments)
@@ -191,6 +221,10 @@ final class HostRouter: Sendable {
             case "credentials.list": try await listCredentials(arguments)
             case "login.prompt": try await loginPrompt(arguments)
             case "login.notify": loginNotify(arguments)
+            case "env.custom": try await customEnvironment(arguments)
+            case "env.shell": try await shell(arguments)
+            case "storage.custom": try await customStorage(arguments)
+            case "conformance.storage", "conformance.environment": try await conformanceSubject(arguments)
             default: throw PiDurableError.runtime("Unknown host method \(method)")
             }
         guard let result else { return nil }
@@ -211,6 +245,8 @@ final class HostRouter: Sendable {
                 case "doc.initial": try seededInitial(arguments)
                 case "doc.checkpoint": try checkpoint(arguments)
                 case "harness.now": try now(arguments)
+                case "wrap.define": try defineWrappedTool(arguments)
+                case "wrap.prepare": try prepareWrappedArguments(arguments)
                 default: throw PiDurableError.runtime("Unknown synchronous host method \(method)")
                 }
             return String(decoding: try BridgeArguments.json(["value": value] as [String: JSONValue]), as: UTF8.self)
@@ -269,6 +305,7 @@ final class HostRouter: Sendable {
             callId: arguments["callId"]?.stringValue ?? "",
             taskId: taskID(arguments),
             harness: try harness(arguments),
+            outputWindow: arguments["outputWindow"].flatMap { $0.isNull ? nil : try? $0.decode(as: OutputWindow.self) },
             handle: try scope(arguments)
         )
     }
@@ -299,6 +336,17 @@ final class HostRouter: Sendable {
 
     private func executeTool(_ arguments: JSONValue) async throws -> ToolResult {
         try await tool(arguments).execute(arguments["arguments"] ?? [:], try toolContext(arguments))
+    }
+
+    private func prepareShell(_ arguments: JSONValue) async throws -> BashExecution {
+        let found = try extensionNamed(arguments)
+        let index = arguments["index"]?.intValue ?? -1
+        guard let tools = found.builtin, tools.indices.contains(index), let prepare = tools[index].prepare else {
+            throw PiDurableError.notFound("Shell tool \(index) of \(found.name)")
+        }
+        var execution = try (arguments["execution"] ?? [:]).decode(as: BashExecution.self)
+        try await prepare(&execution, try toolContext(arguments))
+        return execution
     }
 
     private func prepareArguments(_ arguments: JSONValue) throws -> JSONValue {
@@ -351,8 +399,9 @@ final class HostRouter: Sendable {
     private func onYield(_ arguments: JSONValue) async throws -> JSONValue? {
         let answer = try (arguments["answer"] ?? [:]).decode(as: AssistantMessage.self)
         for case .onYield(let handler) in try hooks(arguments) {
-            if let message = try await handler(answer, try hookContext(arguments)) {
-                return ["continue": .string(message)]
+            if let content = try await handler(answer, try hookContext(arguments)) {
+                if content.count == 1, let text = content[0].text { return ["continue": .string(text)] }
+                return ["continue": try JSONValue(encoding: content)]
             }
         }
         return nil
@@ -419,7 +468,7 @@ final class HostRouter: Sendable {
     }
 
     private func wrapTool(_ arguments: JSONValue) async throws -> ToolResult {
-        guard case .tool(let name, let wrapper) = try wrap(arguments) else {
+        guard case .tool(let name, let toolWrap) = try wrap(arguments), let wrapper = toolWrap.execute else {
             throw PiDurableError.runtime("Not a tool wrap")
         }
         let context = try toolContext(arguments)
@@ -430,6 +479,22 @@ final class HostRouter: Sendable {
                 "wrap.next", ["arguments": replacement.map(JSONValue.object)])
             return try json.decode(as: ToolResult.self)
         }
+    }
+
+    private func defineWrappedTool(_ arguments: JSONValue) throws -> JSONValue {
+        guard case .tool(_, let toolWrap) = try wrap(arguments), let define = toolWrap.definition else {
+            throw PiDurableError.runtime("Not a tool definition wrap")
+        }
+        var definition = try (arguments["definition"] ?? [:]).decode(as: ToolDefinition.self)
+        define(&definition)
+        return try JSONValue(encoding: definition)
+    }
+
+    private func prepareWrappedArguments(_ arguments: JSONValue) throws -> JSONValue {
+        guard case .tool(_, let toolWrap) = try wrap(arguments), let prepare = toolWrap.prepareArguments else {
+            throw PiDurableError.runtime("Not an argument repair wrap")
+        }
+        return prepare(arguments["arguments"] ?? .null)
     }
 
     private func wrapSection(_ arguments: JSONValue) async throws -> String? {
@@ -477,7 +542,7 @@ final class HostRouter: Sendable {
         let registration = try registration(arguments)
         guard let callback = registration.callbacks.onConversationCreated, let harness = registration.harness else { return nil }
         let record = try (arguments["record"] ?? [:]).decode(as: ConversationRecord.self)
-        let transaction = Transaction(handle: ScopeHandle(engine: try engine, id: arguments["tx"]?.intValue ?? 0), harness: harness)
+        let transaction = Transaction(handle: ScopeHandle(engine: try engine, id: arguments["tx"]?.intValue ?? 0))
         try await callback(transaction, record)
         return nil
     }
@@ -488,7 +553,10 @@ final class HostRouter: Sendable {
             conversationId: ConversationID(arguments["conversationId"]?.intValue ?? 0), cwd: arguments["cwd"]?.stringValue,
             handle: try scope(arguments))
         guard let environment = try await choose(target) else { return nil }
-        return ["root": .string(try environment.root())]
+        if case .perConversation = environment.kind {
+            throw PiDurableError.runtime("A per-conversation environment must choose a directory or custom environment")
+        }
+        return try environment.specification(self)
     }
 
     private func report(_ arguments: JSONValue) -> JSONValue? {
@@ -532,6 +600,113 @@ final class HostRouter: Sendable {
         return .bool(checkpointWhen(
             arguments["value"]?.objectValue ?? [:], arguments["ops"]?.arrayValue ?? [],
             arguments["deltasSinceBase"]?.intValue ?? 0))
+    }
+
+    // MARK: Execution environments
+
+    private func customEnvironment(_ arguments: JSONValue) async throws -> JSONValue? {
+        let key = arguments["environment"]?.stringValue ?? ""
+        guard let environment = state.withLock({ $0.environments[key] }) else {
+            throw PiDurableError.runtime("Execution environment \(key) is not registered")
+        }
+        let path = arguments["path"]?.stringValue ?? "/"
+        switch arguments["operation"]?.stringValue {
+        case "stat":
+            let info = try await environment.fileInfo(at: path, followSymlinks: arguments["follow"]?.boolValue ?? true)
+            return try JSONValue(encoding: info)
+        case "read": return .string(try await environment.readFile(at: path).base64EncodedString())
+        case "readRange":
+            guard let offset = arguments["offset"]?.intValue, let length = arguments["length"]?.intValue, offset >= 0, length >= 0
+            else { throw PiDurableError.file(code: "invalid", message: "Invalid byte range", path: path) }
+            let data = try await environment.readFile(at: path, offset: offset, length: length)
+            return .string(data.base64EncodedString())
+        case "write":
+            let data = Data(base64Encoded: arguments["data"]?.stringValue ?? "") ?? Data()
+            try await environment.writeFile(at: path, data: data, append: arguments["append"]?.boolValue ?? false)
+        case "truncate":
+            guard let size = arguments["size"]?.intValue, size >= 0 else {
+                throw PiDurableError.file(code: "invalid", message: "Invalid size", path: path)
+            }
+            try await environment.truncateFile(at: path, size: size)
+        case "sync": try await environment.flushFile(at: path)
+        case "rename": try await environment.moveItem(at: path, to: arguments["destination"]?.stringValue ?? "")
+        case "list": return try JSONValue(encoding: try await environment.contentsOfDirectory(at: path))
+        case "mkdir": try await environment.createDirectory(at: path, recursive: arguments["recursive"]?.boolValue ?? false)
+        case "remove":
+            try await environment.removeItem(
+                at: path, recursive: arguments["recursive"]?.boolValue ?? false, force: arguments["force"]?.boolValue ?? false)
+        case "realpath": return .string(try await environment.canonicalPath(path))
+        case "exec":
+            let command = try (arguments["command"] ?? [:]).decode(as: ShellCommand.self)
+            let output = outputSink(arguments)
+            return ["exitCode": .number(Double(try await environment.run(command, output: output)))]
+        case "cleanup": try await environment.cleanup()
+        default: throw PiDurableError.runtime("Unknown environment operation")
+        }
+        return nil
+    }
+
+    /// Sends a running command's output chunks to JavaScript, in order, before the command's result.
+    private func outputSink(_ arguments: JSONValue) -> @Sendable (String, StandardStream) -> Void {
+        let exec = arguments["exec"]?.intValue ?? 0
+        let engine = try? engine
+        return { text, stream in
+            engine?.send("env.output", ["exec": exec, "text": text, "stream": stream.rawValue])
+        }
+    }
+
+    private func shell(_ arguments: JSONValue) async throws -> JSONValue? {
+        #if os(macOS)
+        let command = try (arguments["command"] ?? [:]).decode(as: ShellCommand.self)
+        let exitCode = try await LocalShell.run(command, output: outputSink(arguments))
+        return ["exitCode": .number(Double(exitCode))]
+        #else
+        throw PiDurableError.execution(code: "shell_unavailable", message: "There is no shell on this platform", spillPath: nil)
+        #endif
+    }
+
+    // MARK: Custom storage
+
+    private func customStorage(_ arguments: JSONValue) async throws -> JSONValue? {
+        let id = arguments["storage"]?.intValue ?? 0
+        guard let storage = state.withLock({ $0.storages[id] }) else { throw PiDurableError.runtime("Storage is closed") }
+        let query = arguments["query"] ?? [:]
+        let limit = arguments["limit"]?.intValue ?? 100
+        let cursor = arguments["cursor"].flatMap { $0.isNull ? JSONValue?.none : $0 }
+        let integer = { (key: String) in arguments[key]?.intValue ?? 0 }
+        switch arguments["operation"]?.stringValue {
+        case "commit": return .number(Double(try await storage.commit(arguments["writes"]?.arrayValue ?? [])))
+        case "mintId": return .number(Double(try await storage.mintId()))
+        case "conversation": return try await storage.conversation(integer("id"))
+        case "scanConversations": return try await storage.scanConversations(query, limit: limit, cursor: cursor)
+        case "entry": return try await storage.entry(integer("id"), visibleFrom: arguments["conversationId"]?.intValue)
+        case "findLatestHeadMarker":
+            return try await storage.findLatestHeadMarker(
+                in: integer("conversationId"), atOrBefore: arguments["atOrBeforeEntryId"]?.intValue)
+        case "scanEntries": return try await storage.scanEntries(query, limit: limit, cursor: cursor)
+        case "task": return try await storage.task(integer("id"))
+        case "scanTasks": return try await storage.scanTasks(query, limit: limit, cursor: cursor)
+        case "submission": return try await storage.submission(integer("id"))
+        case "scanSubmissions": return try await storage.scanSubmissions(query, limit: limit, cursor: cursor)
+        case "submissionByRequest":
+            return try await storage.submission(in: integer("conversationId"), requestId: arguments["requestId"]?.stringValue ?? "")
+        case "findDocument": return try await storage.findDocument(arguments["address"] ?? [:], at: arguments["at"] ?? "current")
+        case "document": return try await storage.document(integer("id"), at: arguments["at"] ?? "current")
+        case "scanDocuments": return try await storage.scanDocuments(query, limit: limit, cursor: cursor)
+        case "close":
+            state.withLock { _ = $0.storages.removeValue(forKey: id) }
+            try await storage.close()
+            return nil
+        default: throw PiDurableError.runtime("Unknown storage operation")
+        }
+    }
+
+    private func conformanceSubject(_ arguments: JSONValue) async throws -> JSONValue {
+        let id = arguments["factory"]?.intValue ?? 0
+        guard let factory = state.withLock({ $0.conformanceFactories[id] }) else {
+            throw PiDurableError.runtime("The conformance run ended")
+        }
+        return try await factory()
     }
 
     // MARK: SQLite databases

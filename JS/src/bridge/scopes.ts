@@ -11,10 +11,11 @@ import type {
 	TaskRuntime,
 	ToolExecutionApi,
 } from "@earendil-works/pi-durable";
+import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { type Args, closeHandle, emit, finish, handle, host, openHandle, openStream, register } from "./core.ts";
 import { draftOf, readDoc, watchArguments } from "./docs.ts";
-import { describeAgent, describeTask, type HarnessState, taskDefinition } from "./state.ts";
+import { describeAgent, describeRegistry, describeSettings, describeTask, type HarnessState, resolveSettings, taskDefinition } from "./state.ts";
 import { runSwiftCommit, taskOwnership } from "./tx.ts";
 
 // biome-ignore lint/suspicious/noExplicitAny: task runtimes are erased across Swift-defined tasks
@@ -26,6 +27,8 @@ export type Scope = {
 	readonly tool?: ToolExecutionApi;
 	readonly runtime?: AnyRuntime;
 	readonly hook?: HookApi;
+	/** A section's environment (`PromptInput.env`). */
+	readonly env?: ExecutionEnv;
 	readonly children: number[];
 };
 
@@ -166,6 +169,14 @@ register({
 				: await owner.memo<JsonValue>(args.name, args.candidate as JsonValue, context);
 		return value ?? null;
 	},
+	"scope.registry": (args) => {
+		const scope = scopeOf(args);
+		return describeRegistry((scope.tool?.registry ?? scope.runtime?.registry ?? scope.harness.registry.snapshot()) as never);
+	},
+	"scope.settings": (args) => {
+		const scope = scopeOf(args);
+		return describeSettings(scope.runtime?.settings ?? resolveSettings(scope.harness.harnessSettings ?? {}));
+	},
 	"scope.agent": async (args, context) => describeAgent(await taskOwner(scopeOf(args)).agent(context)),
 	"scope.tools": async (args, context) => {
 		const agent = await toolOf(scopeOf(args)).agent(context);
@@ -229,7 +240,7 @@ register({
 		const view = await runtimeOf(scopeOf(args)).context(args.conversation as ConversationId, context, {
 			...(args.at == null ? {} : { at: args.at as EntryId }),
 		});
-		return { entries: view.entries, messages: view.messages };
+		return view;
 	},
 	"scope.now": (args) => runtimeOf(scopeOf(args)).now(),
 	"scope.sleep": (args, context) => runtimeOf(scopeOf(args)).sleep(args.until, context),

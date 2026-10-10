@@ -1,5 +1,13 @@
 // Open harnesses and the conversions every module shares.
 import type { Context } from "@earendil-works/chord";
+import {
+	DEFAULT_COMPACTION_POLICY,
+	DEFAULT_PROGRESS_POLICY,
+	DEFAULT_RETRY_POLICY,
+	type HarnessSettings,
+	type RegistrySnapshot,
+	type Settings,
+} from "@earendil-works/pi-durable";
 import type {
 	Agent,
 	AgentChange,
@@ -8,6 +16,7 @@ import type {
 	ConversationId,
 	Extension,
 	Harness,
+	HarnessOptions,
 	Registry,
 	TaskOutcome,
 	TaskRecord,
@@ -20,6 +29,10 @@ export type HarnessState = {
 	harness: Harness;
 	readonly registry: Registry;
 	readonly settings: { value: Args };
+	/** `HarnessOptions.settings`: live getters over the newest settings Swift sent. */
+	harnessSettings?: HarnessSettings;
+	/** `HarnessOptions.env`, if the harness has an environment. */
+	env?: NonNullable<HarnessOptions["env"]>;
 };
 
 export const harnesses = new Map<number, HarnessState>();
@@ -75,8 +88,54 @@ export function describeAgent(agent: Agent) {
 		thinkingLevel: agent.thinkingLevel,
 		extensions: agent.extensions.map((extension) => extension.name),
 		tools: agent.tools.map((tool) => tool.name),
+		sections: agent.sections.map((section) => ({ key: section.key, tag: section.tag !== false })),
 		instructions: agent.instructions ?? null,
 		cwd: agent.cwd ?? null,
+	};
+}
+
+/** A registry snapshot as data: what each installed extension brings, and every task definition. */
+export function describeRegistry(snapshot: RegistrySnapshot) {
+	return {
+		extensions: snapshot.installed().map((extension) => ({
+			name: extension.name,
+			tools: (extension.tools ?? []).map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+				replay: tool.replay ?? "unsafe",
+				executionMode: tool.executionMode ?? null,
+			})),
+			sections: (extension.sections ?? []).map((section) => ({ key: section.key, tag: section.tag !== false })),
+			hooks: (extension.hooks ?? []).map((hook) => hook.task),
+			wraps: (extension.wraps ?? []).map((wrap) => ("tool" in wrap ? { tool: wrap.tool } : { section: wrap.section })),
+			tasks: (extension.tasks ?? []).map((task) => task.definition.name),
+		})),
+		tasks: snapshot.tasks().map((task) => ({ name: task.definition.name, version: task.definition.version })),
+	};
+}
+
+/** Settings as data: extensions by name, every other field as given. */
+export function describeSettings(settings: Partial<Settings> & Args) {
+	const { extensions, ...rest } = settings;
+	return { ...rest, ...(extensions === undefined ? {} : { extensions: extensions.map((extension: Extension) => extension.name) }) };
+}
+
+/** `HarnessSettings` resolved over pi-durable's defaults, as `resolveSettings()` does. */
+export function resolveSettings(settings: HarnessSettings): Settings {
+	return {
+		...(settings.extensions === undefined ? {} : { extensions: settings.extensions }),
+		stream: { ...settings.stream },
+		retry: { ...DEFAULT_RETRY_POLICY, ...settings.retry },
+		compaction: { ...DEFAULT_COMPACTION_POLICY, ...settings.compaction },
+		progress: {
+			partialIntervalMs: settings.progress?.partialIntervalMs ?? DEFAULT_PROGRESS_POLICY.partialIntervalMs,
+			outputIntervalMs: settings.progress?.outputIntervalMs ?? DEFAULT_PROGRESS_POLICY.outputIntervalMs,
+		},
+		toolExecution: settings.toolExecution ?? "parallel",
+		steeringMode: settings.steeringMode ?? "one-at-a-time",
+		followUpMode: settings.followUpMode ?? "one-at-a-time",
+		contextRetentionMs: settings.contextRetentionMs ?? 600_000,
 	};
 }
 

@@ -49,7 +49,7 @@ module.exports = defineExtension({
         #expect(results.last?.isError == true)
         #expect(results.last?.text.contains("Too many sides") == true)
 
-        let (_, messages) = try await root.context()
+        let messages = try await root.context().messages
         let prompt = messages.compactMap { message -> String? in
             guard case .system(let system) = message else { return nil }
             return ([system.text] + system.sections.values.compactMap { $0 }).joined(separator: "\n")

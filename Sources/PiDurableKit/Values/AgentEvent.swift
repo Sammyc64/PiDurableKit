@@ -15,19 +15,23 @@ public enum AgentEvent: Sendable, Hashable {
     case messageUpdate(changes: [MessageChange], usage: Usage)
     case messageEnd(Entry)
     case toolExecutionStart(callId: String, toolName: String, arguments: JSONObject)
-    case toolExecutionUpdate(callId: String, toolName: String, output: OutputChange?, details: JSONValue?)
+    /// `diagnostics` is the call's whole diagnostics list, when it changed.
+    case toolExecutionUpdate(
+        callId: String, toolName: String, output: OutputChange?, details: JSONValue?, diagnostics: [ToolDiagnostic]?)
     /// `entry` is absent when the tool task faulted or was orphaned.
     case toolExecutionEnd(callId: String, toolName: String, entry: Entry?)
     case inboxUpdate([QueuedItem])
     case submission(SubmissionRecord)
     case autoRetryStart(attempt: Int, at: Date, errorMessage: String)
     case autoRetryEnd(attempt: Int)
+    /// A provider-side deferred response is polled next at `pollAt`.
+    case deferredPoll(pollAt: Date)
     case entryAppended(Entry)
     case agentChanged(AgentState)
     case usageChanged(UsageState)
     case taskFailed(taskId: TaskID, kind: String, message: String)
-    case compactionStart(taskId: TaskID, reason: String, blocking: Bool)
-    case compactionEnd(taskId: TaskID, reason: String)
+    case compactionStart(taskId: TaskID, reason: CompactionReason, blocking: Bool)
+    case compactionEnd(taskId: TaskID, reason: CompactionReason)
     /// An event this version of PiDurableKit does not know.
     case other(type: String, JSONValue)
 
@@ -36,21 +40,26 @@ public enum AgentEvent: Sendable, Hashable {
         public let entries: [Entry]
         /// The inputs of the running run, if busy.
         public let run: [SubmissionID]?
+        /// The current generation attempt: its in-flight partial, retry backoff, or deferred poll.
+        public let generation: GenerationStatus?
         /// The in-flight partial response, if a generation is streaming.
-        public let message: AssistantMessage?
+        public var message: AssistantMessage? { generation?.message }
         public let tools: [LiveState.ToolSlot]
+        /// Live compactions with their attempt and retry backoff.
+        public let compactions: [CompactionStatus]
         public let inbox: [QueuedItem]
         public let agent: AgentState
         public let usage: UsageState
 
-        private enum CodingKeys: String, CodingKey { case entries, run, generation, tools, inbox, agent, usage }
+        private enum CodingKeys: String, CodingKey { case entries, run, generation, tools, compactions, inbox, agent, usage }
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             entries = try container.decodeIfPresent([Entry].self, forKey: .entries) ?? []
             run = try container.decodeIfPresent(JSONValue.self, forKey: .run)?["inputs"].flatMap { try? $0.decode(as: [SubmissionID].self) }
-            message = try container.decodeIfPresent(JSONValue.self, forKey: .generation)?["message"].flatMap { try? $0.decode(as: AssistantMessage.self) }
+            generation = try? container.decodeIfPresent(GenerationStatus.self, forKey: .generation)
             tools = (try? container.decodeIfPresent([LiveState.ToolSlot].self, forKey: .tools)) ?? []
+            compactions = (try? container.decodeIfPresent([CompactionStatus].self, forKey: .compactions)) ?? []
             inbox = (try? container.decodeIfPresent([QueuedItem].self, forKey: .inbox)) ?? []
             agent = (try? container.decodeIfPresent(AgentState.self, forKey: .agent)) ?? AgentState()
             usage = (try? container.decodeIfPresent(UsageState.self, forKey: .usage)) ?? UsageState()
@@ -59,8 +68,7 @@ public enum AgentEvent: Sendable, Hashable {
 
     public struct QueuedItem: Decodable, Sendable, Hashable {
         public let id: SubmissionID
-        /// `steer`, `followUp`, or `write`.
-        public let mode: String
+        public let mode: InboxItem.Mode
     }
 
     /// A change to the running output of a tool call.
@@ -151,7 +159,8 @@ extension AgentEvent: Decodable {
                 output = .append(change["append"]?.stringValue ?? "", trimStart: change["trimStart"]?.intValue ?? 0)
             }
             return .toolExecutionUpdate(
-                callId: string("toolCallId"), toolName: string("toolName"), output: output, details: json["details"])
+                callId: string("toolCallId"), toolName: string("toolName"), output: output, details: json["details"],
+                diagnostics: json["diagnostics"].flatMap { try? $0.decode(as: [ToolDiagnostic].self) })
         case "tool_execution_end":
             return .toolExecutionEnd(
                 callId: string("toolCallId"), toolName: string("toolName"), entry: try? value("entry", as: Entry.self))
@@ -163,6 +172,7 @@ extension AgentEvent: Decodable {
                 at: Date(timeIntervalSince1970: (json["at"]?.doubleValue ?? 0) / 1000),
                 errorMessage: string("errorMessage"))
         case "auto_retry_end": return .autoRetryEnd(attempt: json["attempt"]?.intValue ?? 0)
+        case "deferred_poll": return .deferredPoll(pollAt: Date(timeIntervalSince1970: (json["pollAt"]?.doubleValue ?? 0) / 1000))
         case "entry_appended": return .entryAppended(try value("entry"))
         case "agent_changed": return .agentChanged(try value("agent"))
         case "usage_changed": return .usageChanged(try value("usage"))
@@ -170,8 +180,10 @@ extension AgentEvent: Decodable {
             return .taskFailed(taskId: try value("taskId"), kind: string("kind"), message: string("message"))
         case "compaction_start":
             return .compactionStart(
-                taskId: try value("taskId"), reason: string("reason"), blocking: json["blocking"]?.boolValue ?? false)
-        case "compaction_end": return .compactionEnd(taskId: try value("taskId"), reason: string("reason"))
+                taskId: try value("taskId"), reason: CompactionReason(rawValue: string("reason")),
+                blocking: json["blocking"]?.boolValue ?? false)
+        case "compaction_end":
+            return .compactionEnd(taskId: try value("taskId"), reason: CompactionReason(rawValue: string("reason")))
         default: return .other(type: type, json)
         }
     }

@@ -2,9 +2,9 @@ import Foundation
 
 /// Run policy shared by every conversation of a ``Harness``. Never stored; update it any time with
 /// ``Harness/updateSettings(_:)``. Unset fields use pi-durable's defaults.
-public struct Settings: Encodable, Sendable, Hashable {
+public struct Settings: Codable, Sendable, Hashable {
     /// pi-ai request options.
-    public struct Stream: Encodable, Sendable, Hashable {
+    public struct Stream: Codable, Sendable, Hashable {
         /// Per-request timeout.
         public var timeout: Duration?
         /// Provider SDK retries inside one request attempt.
@@ -57,10 +57,29 @@ public struct Settings: Encodable, Sendable, Hashable {
             case nil: break
             }
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: AnyKey.self)
+            timeout = try container.decodeIfPresent(Double.self, forKey: AnyKey("timeoutMs")).map { Duration.milliseconds($0) }
+            maxRetries = try container.decodeIfPresent(Int.self, forKey: AnyKey("maxRetries"))
+            maxRetryDelay = try container.decodeIfPresent(Double.self, forKey: AnyKey("maxRetryDelayMs")).map { Duration.milliseconds($0) }
+            headers = try container.decodeIfPresent([String: String].self, forKey: AnyKey("headers"))
+            cacheRetention = try container.decodeIfPresent(String.self, forKey: AnyKey("cacheRetention"))
+            transport = try container.decodeIfPresent(String.self, forKey: AnyKey("transport"))
+            metadata = try container.decodeIfPresent(JSONObject.self, forKey: AnyKey("metadata"))
+            let deferred = try container.decodeIfPresent(JSONValue.self, forKey: AnyKey("deferred"))
+            if let window = deferred?["window"]?.stringValue {
+                self.deferred = .window(window)
+            } else if deferred?.boolValue == true || deferred?.objectValue != nil {
+                self.deferred = .enabled
+            } else {
+                self.deferred = nil
+            }
+        }
     }
 
     /// Durable retries of failed generation attempts.
-    public struct Retry: Encodable, Sendable, Hashable {
+    public struct Retry: Codable, Sendable, Hashable {
         public var enabled: Bool?
         public var maxRetries: Int?
         public var baseDelay: Duration?
@@ -79,6 +98,14 @@ public struct Settings: Encodable, Sendable, Hashable {
             try container.encodeIfPresent(maxRetries, forKey: AnyKey("maxRetries"))
             try container.encodeIfPresent(baseDelay?.milliseconds, forKey: AnyKey("baseDelayMs"))
             try container.encodeIfPresent(maxDelay?.milliseconds, forKey: AnyKey("maxAgentDelayMs"))
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: AnyKey.self)
+            enabled = try container.decodeIfPresent(Bool.self, forKey: AnyKey("enabled"))
+            maxRetries = try container.decodeIfPresent(Int.self, forKey: AnyKey("maxRetries"))
+            baseDelay = try container.decodeIfPresent(Double.self, forKey: AnyKey("baseDelayMs")).map { Duration.milliseconds($0) }
+            maxDelay = try container.decodeIfPresent(Double.self, forKey: AnyKey("maxAgentDelayMs")).map { Duration.milliseconds($0) }
         }
     }
 
@@ -101,7 +128,7 @@ public struct Settings: Encodable, Sendable, Hashable {
     }
 
     /// How often running progress (partial answers, tool output) is committed.
-    public struct Progress: Encodable, Sendable, Hashable {
+    public struct Progress: Codable, Sendable, Hashable {
         public var partialInterval: Duration?
         public var outputInterval: Duration?
 
@@ -115,13 +142,19 @@ public struct Settings: Encodable, Sendable, Hashable {
             try container.encodeIfPresent(partialInterval?.milliseconds, forKey: AnyKey("partialIntervalMs"))
             try container.encodeIfPresent(outputInterval?.milliseconds, forKey: AnyKey("outputIntervalMs"))
         }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: AnyKey.self)
+            partialInterval = try container.decodeIfPresent(Double.self, forKey: AnyKey("partialIntervalMs")).map { Duration.milliseconds($0) }
+            outputInterval = try container.decodeIfPresent(Double.self, forKey: AnyKey("outputIntervalMs")).map { Duration.milliseconds($0) }
+        }
     }
 
-    public enum ToolExecution: String, Encodable, Sendable {
+    public enum ToolExecution: String, Codable, Sendable {
         case parallel, sequential
     }
 
-    public enum QueueMode: String, Encodable, Sendable {
+    public enum QueueMode: String, Codable, Sendable {
         case all
         case oneAtATime = "one-at-a-time"
     }
@@ -171,6 +204,19 @@ public struct Settings: Encodable, Sendable, Hashable {
         try container.encodeIfPresent(steeringMode, forKey: AnyKey("steeringMode"))
         try container.encodeIfPresent(followUpMode, forKey: AnyKey("followUpMode"))
         try container.encodeIfPresent(contextRetention?.milliseconds, forKey: AnyKey("contextRetentionMs"))
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyKey.self)
+        extensions = try container.decodeIfPresent([String].self, forKey: AnyKey("extensions"))
+        stream = try container.decodeIfPresent(Stream.self, forKey: AnyKey("stream"))
+        retry = try container.decodeIfPresent(Retry.self, forKey: AnyKey("retry"))
+        compaction = try container.decodeIfPresent(Compaction.self, forKey: AnyKey("compaction"))
+        progress = try container.decodeIfPresent(Progress.self, forKey: AnyKey("progress"))
+        toolExecution = try container.decodeIfPresent(ToolExecution.self, forKey: AnyKey("toolExecution"))
+        steeringMode = try container.decodeIfPresent(QueueMode.self, forKey: AnyKey("steeringMode"))
+        followUpMode = try container.decodeIfPresent(QueueMode.self, forKey: AnyKey("followUpMode"))
+        contextRetention = try container.decodeIfPresent(Double.self, forKey: AnyKey("contextRetentionMs")).map { Duration.milliseconds($0) }
     }
 }
 

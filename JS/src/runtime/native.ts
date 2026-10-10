@@ -45,6 +45,11 @@ export interface NativeHost {
 	fsStat(path: string, follow: boolean): string;
 	fsReadFile(path: string): Uint8Array;
 	fsReadRange(path: string, offset: number, length: number): Uint8Array;
+	/** Opens a regular file; reads by descriptor keep reading it after a rename. */
+	fsOpen(path: string, noFollow: boolean): number;
+	fsReadAt(descriptor: number, offset: number, length: number): Uint8Array;
+	fsFstat(descriptor: number, name: string): string;
+	fsClose(descriptor: number): void;
 	fsWrite(path: string, content: string | Uint8Array, append: boolean): void;
 	fsTruncate(path: string, size: number): void;
 	fsSync(path: string): void;

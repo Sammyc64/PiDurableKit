@@ -170,3 +170,42 @@ extension Entry {
         return try? data.decode(as: Data.self)
     }
 }
+
+/// The data of a `pi.tool-result` entry: the structured diagnostics also rendered into its content.
+public struct ToolResultEntryData: Codable, Sendable, Hashable {
+    public var diagnostics: [ToolDiagnostic]
+}
+
+/// The data of a `pi.compaction` entry.
+public struct CompactionEntryData: Codable, Sendable, Hashable {
+    public var reason: CompactionReason
+}
+
+/// An entry kind without data, such as `pi.user`.
+public struct NoEntryData: Codable, Sendable, Hashable {}
+
+extension EntryType where Data == ToolResultEntryData {
+    /// Tool results (pi-durable `ToolResultEntry`).
+    public static var toolResult: EntryType<ToolResultEntryData> { EntryType(.toolResult) }
+}
+
+extension EntryType where Data == CompactionEntryData {
+    /// Compaction summaries (pi-durable `CompactionEntry`).
+    public static var compaction: EntryType<CompactionEntryData> { EntryType(.compaction) }
+}
+
+extension EntryType where Data == NoEntryData {
+    /// User input (pi-durable `UserEntry`).
+    public static var user: EntryType<NoEntryData> { EntryType(.user) }
+    /// Model responses (pi-durable `AssistantEntry`).
+    public static var assistant: EntryType<NoEntryData> { EntryType(.assistant) }
+    /// Positional prompt and tool changes (pi-durable `SystemEntry`).
+    public static var system: EntryType<NoEntryData> { EntryType(.system) }
+    /// Context resets (pi-durable `ResetEntry`).
+    public static var reset: EntryType<NoEntryData> { EntryType(.reset) }
+}
+
+extension Entry {
+    /// Whether the entry is of this type (pi-durable `Entry.is`).
+    public func `is`<Data>(_ type: EntryType<Data>) -> Bool { kind == type.kind }
+}

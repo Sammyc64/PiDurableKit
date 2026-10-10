@@ -13,13 +13,15 @@ import {
 	type PromptSection,
 	section,
 	ToolTask,
+	type ToolExecutionApi,
 	type ToolRegistration,
 	type Wrap,
 	wrapSection,
 	wrapTool,
 } from "@earendil-works/pi-durable";
-import { createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createBashTool, createEditTool, createPowerShellTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { type Args, handle, host, hostSync, register } from "./core.ts";
+import { fromBase64 } from "./env.ts";
 import { evaluateExtension } from "./javascript.ts";
 import { type Scope, withScope } from "./scopes.ts";
 import { describeAgent, describeTask, type HarnessState } from "./state.ts";
@@ -33,8 +35,48 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 
 	if (typeof spec.javaScript === "string") return evaluateExtension(spec.javaScript, name, spec.sourceURL ?? undefined);
 
-	if (spec.builtin === "coding") {
-		return defineExtension({ name, tools: [createReadTool(), createWriteTool(), createEditTool()] as never });
+	if (spec.builtin === "tools") {
+		const prepare = (item: Args) =>
+			item.prepares
+				? async (execution: Args, api: ToolExecutionApi, context: Context) => {
+						const next = await withScope({ harness: state, reader: api, tool: api }, (scope) =>
+							host<Args>(
+								"tool.prepareShell",
+								{
+									...base,
+									index: item.index,
+									handle: scope,
+									execution,
+									callId: api.callId,
+									taskId: api.taskId,
+									conversationId: api.conversationId,
+									outputWindow: api.outputWindow ?? null,
+								},
+								context,
+							),
+						);
+						Object.assign(execution, next);
+					}
+				: undefined;
+		const shellOptions = (item: Args) => ({
+			...(item.commandPrefix == null ? {} : { commandPrefix: item.commandPrefix }),
+			...(item.prepares ? { prepare: prepare(item) } : {}),
+		});
+		const tools = (spec.builtinTools as Args[]).map((item) => {
+			switch (item.kind) {
+				case "read":
+					return createReadTool();
+				case "write":
+					return createWriteTool();
+				case "edit":
+					return createEditTool();
+				case "bash":
+					return createBashTool(shellOptions(item) as never);
+				default:
+					return createPowerShellTool({ ...shellOptions(item), ...(item.programs == null ? {} : { programs: item.programs }) } as never);
+			}
+		});
+		return defineExtension({ name, tools: tools as never });
 	}
 
 	const tools: ToolRegistration[] = (spec.tools ?? []).map((tool: Args) =>
@@ -60,6 +102,7 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 							callId: api.callId,
 							taskId: api.taskId,
 							conversationId: api.conversationId,
+							outputWindow: api.outputWindow ?? null,
 						},
 						context,
 					).then((result) => (result ?? {}) as never),
@@ -72,7 +115,7 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 			item.key,
 			async (input, context) => {
 				if (typeof item.text === "string") return item.text;
-				const rendered = await withScope({ harness: state, reader: input.read }, (scope) =>
+				const rendered = await withScope({ harness: state, reader: input.read, ...(input.env === undefined ? {} : { env: input.env }) }, (scope) =>
 					host<string | null>(
 						"section.render",
 						{
@@ -145,8 +188,39 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 
 	const wraps: Wrap[] = (spec.wraps ?? []).map((wrap: Args) => {
 		if (wrap.tool !== undefined) {
-			return wrapTool({ name: wrap.tool } as ToolRegistration, (tool) => ({
-				...tool,
+			return wrapTool({ name: wrap.tool } as ToolRegistration, (tool) => {
+				const wrapped: ToolRegistration = { ...tool };
+				if (wrap.defines) {
+					// The Swift wrap's definition change: description, parameters, and run options, never the name.
+					const definition = hostSync<Args>("wrap.define", {
+						...base,
+						wrap: wrap.index,
+						definition: {
+							name: tool.name,
+							description: tool.description,
+							parameters: tool.parameters,
+							replay: tool.replay ?? null,
+							executionMode: tool.executionMode ?? null,
+							outputLimits: tool.outputLimits ?? null,
+						},
+					});
+					Object.assign(wrapped, {
+						description: definition.description,
+						parameters: definition.parameters,
+						...(definition.replay == null ? {} : { replay: definition.replay }),
+						...(definition.executionMode == null ? {} : { executionMode: definition.executionMode }),
+						...(definition.outputLimits == null ? {} : { outputLimits: definition.outputLimits }),
+					});
+				}
+				if (wrap.prepares) {
+					wrapped.prepareArguments = (raw: unknown) => {
+						const repaired = hostSync("wrap.prepare", { ...base, wrap: wrap.index, arguments: raw ?? null });
+						return (tool.prepareArguments === undefined ? repaired : tool.prepareArguments(repaired)) as never;
+					};
+				}
+				if (wrap.executes === false) return wrapped;
+				return {
+				...wrapped,
 				execute: (args, api, context) =>
 					withScope({ harness: state, reader: api, tool: api, next: (input: unknown) => tool.execute((input ?? args) as never, api, context) }, (scope) =>
 						host<Args | null>(
@@ -159,16 +233,25 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 								callId: api.callId,
 								taskId: api.taskId,
 								conversationId: api.conversationId,
+								outputWindow: api.outputWindow ?? null,
 							},
 							context,
 						).then((result) => (result ?? {}) as never),
 					),
-			}));
+				};
+			});
 		}
 		return wrapSection(wrap.section, (original) => ({
 			...original,
 			render: (input, context) =>
-				withScope({ harness: state, reader: input.read, next: async () => (await original.render(input, context)) ?? null }, (scope) =>
+				withScope(
+					{
+						harness: state,
+						reader: input.read,
+						...(input.env === undefined ? {} : { env: input.env }),
+						next: async () => (await original.render(input, context)) ?? null,
+					},
+					(scope) =>
 					host<string | null>(
 						"wrap.section",
 						{
@@ -218,7 +301,8 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 register({
 	"wrap.next": async (args) => (await handle<Scope & Next>(args.handle).next(args.arguments ?? undefined)) ?? null,
 	"tool.output": (args) => {
-		handle<Scope>(args.handle).tool?.output(args.chunk);
+		const chunk = typeof args.base64 === "string" ? fromBase64(args.base64) : (args.chunk as string);
+		handle<Scope>(args.handle).tool?.output(chunk, args.skipped ?? undefined);
 	},
 	"tool.details": async (args, context) => {
 		await handle<Scope>(args.handle).tool?.details(args.details, context);

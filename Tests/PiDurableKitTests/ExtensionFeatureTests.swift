@@ -65,7 +65,7 @@ import Testing
         let requests = Mutex<[String]>([])
         let summarize = Extension("summarize") {
             Hook.beforeCompact { request, _ in
-                requests.update { $0.append(request.reason) }
+                requests.update { $0.append(request.reason.rawValue) }
                 return .summary("Custom summary of \(request.entries.count) entries")
             }
         }
@@ -163,7 +163,7 @@ import Testing
         try await setup.faux.append(.text("OK"))
         let root = try await setup.root()
         _ = try await ask(root, "Hi")
-        let (_, messages) = try await root.context()
+        let messages = try await root.context().messages
         let system = try #require(messages.compactMap { message -> SystemMessage? in
             if case .system(let system) = message { return system }
             return nil

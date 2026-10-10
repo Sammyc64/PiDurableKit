@@ -27,6 +27,10 @@ export function serializeError(error: unknown): Json {
 			message: error.message,
 			stack: error.stack ?? null,
 			code: ((error as { code?: unknown }).code as Json) ?? null,
+			// The fields pi-durable's error classes carry: `ConversationBusy`, `FileError`, `ExecutionError`.
+			conversationId: ((error as { conversationId?: unknown }).conversationId as Json) ?? null,
+			path: ((error as { path?: unknown }).path as Json) ?? null,
+			spillPath: ((error as { spillPath?: unknown }).spillPath as Json) ?? null,
 		};
 	}
 	return { name: "Error", message: String(error), stack: null, code: null };
@@ -81,9 +85,12 @@ runtimeCallbacks.hostReject = ((id: number, json: string) => {
 }) as never;
 
 function hostError(json: string): Error {
-	const info = JSON.parse(json) as { name?: string; message?: string };
+	const info = JSON.parse(json) as { name?: string; message?: string; code?: string; path?: string };
 	const error = new Error(info.message ?? "Host call failed");
 	if (info.name) error.name = info.name;
+	// Environments implemented in Swift report file and command failures with pi-durable's codes.
+	if (info.code) Object.assign(error, { code: info.code });
+	if (info.path) Object.assign(error, { path: info.path });
 	return error;
 }
 

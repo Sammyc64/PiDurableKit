@@ -74,6 +74,44 @@ enum FileOperations {
         return Info(name: (path as NSString).lastPathComponent, kind: kind, size: Double(status.st_size), mtimeMs: modified)
     }
 
+    /// Opens a regular file for positional reads that keep reading it after a rename; with `noFollow`, a final
+    /// symbolic link is refused.
+    static func open(_ path: String, noFollow: Bool) throws -> Int32 {
+        let descriptor = Darwin.open(path, O_RDONLY | O_CLOEXEC | (noFollow ? O_NOFOLLOW : 0))
+        guard descriptor >= 0 else {
+            if errno == ELOOP { throw FileOperationError(code: "invalid", "\(path): is a symbolic link") }
+            throw FileOperationError.posix(path)
+        }
+        var status = Darwin.stat()
+        guard fstat(descriptor, &status) == 0 else {
+            Darwin.close(descriptor)
+            throw FileOperationError.posix(path)
+        }
+        switch status.st_mode & S_IFMT {
+        case S_IFREG: return descriptor
+        case S_IFDIR:
+            Darwin.close(descriptor)
+            throw FileOperationError(code: "is_directory", "\(path): is a directory")
+        default:
+            Darwin.close(descriptor)
+            throw FileOperationError(code: "invalid", "\(path): not a regular file")
+        }
+    }
+
+    static func read(descriptor: Int32, offset: Int, length: Int) throws -> Data {
+        var data = Data(count: length)
+        let count = data.withUnsafeMutableBytes { pread(descriptor, $0.baseAddress, length, off_t(offset)) }
+        guard count >= 0 else { throw FileOperationError.posix("file \(descriptor)") }
+        return data.prefix(count)
+    }
+
+    static func info(descriptor: Int32, name: String) throws -> Info {
+        var status = Darwin.stat()
+        guard fstat(descriptor, &status) == 0 else { throw FileOperationError.posix(name) }
+        let modified = Double(status.st_mtimespec.tv_sec) * 1000 + Double(status.st_mtimespec.tv_nsec) / 1_000_000
+        return Info(name: name, kind: "file", size: Double(status.st_size), mtimeMs: modified)
+    }
+
     static func statJSON(_ path: String, follow: Bool) throws -> String {
         try String(decoding: JSONEncoder().encode(info(path, follow: follow)), as: UTF8.self)
     }

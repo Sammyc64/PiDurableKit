@@ -57,7 +57,7 @@ struct ScopeHandle: Sendable {
     }
 
     func commit<T: Sendable>(harness: Harness, _ body: @escaping @Sendable (Transaction) async throws -> T) async throws -> T {
-        try await Transaction.run(harness: harness) { commit in
+        try await Transaction.run(engine: harness.engine) { commit in
             try await perform("scope.commit", ["commit": commit])
         } body: { transaction, _ in
             (try await body(transaction), nil)
@@ -88,20 +88,18 @@ public enum DocumentOwner: Sendable, Hashable, Encodable {
 /// ``TaskRun/commit(_:)``. A transaction is only valid inside its closure.
 public struct Transaction: Sendable {
     let handle: ScopeHandle
-    let harness: Harness
 
     /// Runs `body` in a commit started by `start`, which receives the id of the registered closure.
     /// `body` returns its value and the JSON it hands back to JavaScript.
     static func run<T: Sendable>(
-        harness: Harness,
+        engine: Engine,
         start: (Int) async throws -> Void,
         body: @escaping @Sendable (Transaction, JSONValue) async throws -> (T, JSONValue?)
     ) async throws -> T {
         let box = ResultBox<T>()
-        let engine = harness.engine
         let commit = engine.host.registerCommit { tx, extra in
             do {
-                let (value, json) = try await body(Transaction(handle: ScopeHandle(engine: engine, id: tx), harness: harness), extra)
+                let (value, json) = try await body(Transaction(handle: ScopeHandle(engine: engine, id: tx)), extra)
                 box.set(.success(value))
                 return json
             } catch {
@@ -148,12 +146,28 @@ public struct Transaction: Sendable {
             ["ownerTask": task, "ownerConversation": ownerConversation, "order": order, "limit": limit, "cursor": cursor])
     }
 
-    /// A conversation's visible history, newest first by default.
+    /// A conversation's visible history, newest first by default, optionally between two entries (inclusive).
     public func entries(
-        in conversation: ConversationID, order: ScanOrder? = nil, limit: Int = 50, after cursor: Cursor? = nil
+        in conversation: ConversationID, from oldest: EntryID? = nil, through newest: EntryID? = nil,
+        order: ScanOrder? = nil, limit: Int = 50, after cursor: Cursor? = nil
     ) async throws -> Page<Entry> {
         try await handle.call(
-            "tx.scanEntries", ["conversation": conversation, "order": order, "limit": limit, "cursor": cursor])
+            "tx.scanEntries",
+            [
+                "conversation": conversation, "minEntryId": oldest, "maxEntryId": newest, "order": order, "limit": limit,
+                "cursor": cursor,
+            ])
+    }
+
+    /// The newest visible entry of the conversation that carries a `head`: the reset or compaction where its
+    /// active context starts.
+    public func latestHeadMarker(in conversation: ConversationID) async throws -> Entry? {
+        try await handle.call("tx.latestHeadMarker", ["conversation": conversation])
+    }
+
+    /// The submission with this conversation-scoped request ID, if any.
+    public func submission(in conversation: ConversationID, requestId: String) async throws -> SubmissionRecord? {
+        try await handle.call("tx.submissionByRequest", ["conversation": conversation, "requestId": requestId])
     }
 
     /// Task records matching every given filter.
@@ -208,6 +222,25 @@ public struct Transaction: Sendable {
             ])
     }
 
+    // MARK: Raw submissions
+
+    /// Creates a raw submission record with a fresh ID. No admission rules apply: no busy check, no inbox queueing, no
+    /// placement. Use ``Conversation/submit(_:whenBusy:requestId:)`` unless you implement admission yourself.
+    @discardableResult
+    public func createSubmission(_ submission: SubmissionDraftRecord) async throws -> SubmissionRecord {
+        try await handle.call("tx.createSubmission", ["submission": submission])
+    }
+
+    /// Settles a queued or placed submission. Only a placed input can be answered; a settled submission stays unchanged.
+    public func settleSubmission(_ id: SubmissionID, _ settlement: SubmissionSettlement) async throws {
+        try await handle.perform("tx.settleSubmission", ["submission": id, "settlement": settlement])
+    }
+
+    /// Places a queued submission at `entry`: an input becomes placed, a write done.
+    public func placeSubmission(_ id: SubmissionID, at entry: EntryID) async throws {
+        try await handle.perform("tx.placeSubmission", ["submission": id, "entry": entry])
+    }
+
     /// Changes a conversation's agent in this commit.
     public func configure(_ conversation: ConversationID, _ change: AgentChange) async throws {
         try await handle.perform("tx.configure", ["conversation": conversation, "change": change])
@@ -254,6 +287,54 @@ public struct Transaction: Sendable {
     }
 }
 
+/// A raw submission record before the session assigns its ID (pi-durable `SubmissionCreate`), for
+/// ``Transaction/createSubmission(_:)``.
+public struct SubmissionDraftRecord: Encodable, Sendable, Hashable {
+    public var conversationId: ConversationID
+    public var requestId: String?
+    public var type: SubmissionRecord.SubmissionType
+    public var status: SubmissionRecord.Status
+
+    public init(
+        conversationId: ConversationID, type: SubmissionRecord.SubmissionType, status: SubmissionRecord.Status = .queued,
+        requestId: String? = nil
+    ) {
+        self.conversationId = conversationId
+        self.requestId = requestId
+        self.type = type
+        self.status = status
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: AnyKey.self)
+        try container.encode(conversationId, forKey: AnyKey("conversationId"))
+        try container.encodeIfPresent(requestId, forKey: AnyKey("requestId"))
+        try container.encode(type, forKey: AnyKey("type"))
+        try status.encode(into: &container)
+    }
+}
+
+/// The terminal status staged for a submission (pi-durable `SubmissionSettlement`).
+public enum SubmissionSettlement: Encodable, Sendable, Hashable {
+    /// The input was answered by this entry.
+    case done(answer: EntryID)
+    /// The submission can no longer be answered.
+    case unanswered(reason: String, detail: JSONValue? = nil)
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: AnyKey.self)
+        switch self {
+        case .done(let answer):
+            try container.encode("done", forKey: AnyKey("status"))
+            try container.encode(answer, forKey: AnyKey("answer"))
+        case .unanswered(let reason, let detail):
+            try container.encode("unanswered", forKey: AnyKey("status"))
+            try container.encode(reason, forKey: AnyKey("reason"))
+            try container.encodeIfPresent(detail, forKey: AnyKey("detail"))
+        }
+    }
+}
+
 /// The direction of a scan (pi-durable `ScanOrder`).
 public enum ScanOrder: String, Codable, Sendable {
     case ascending, descending
@@ -264,15 +345,14 @@ public struct TaskQuery: Encodable, Sendable, Hashable {
     public var conversationId: ConversationID?
     /// The task definition's name.
     public var kind: String?
-    /// `pending`, `running`, `waiting`, `completing`, or `terminal`.
-    public var status: String?
+    public var status: TaskStatus?
     public var abortRequested: Bool?
     public var background: Bool?
     /// Oldest first by default.
     public var order: ScanOrder?
 
     public init(
-        conversationId: ConversationID? = nil, kind: String? = nil, status: String? = nil, abortRequested: Bool? = nil,
+        conversationId: ConversationID? = nil, kind: String? = nil, status: TaskStatus? = nil, abortRequested: Bool? = nil,
         background: Bool? = nil, order: ScanOrder? = nil
     ) {
         self.order = order
@@ -296,7 +376,17 @@ public struct ConversationHandle: Sendable, Identifiable {
     public func submit(_ text: String, whenBusy: Conversation.WhenBusy = .followUp, requestId: String? = nil) async throws
         -> Submission
     {
-        var submission: JSONObject = ["type": "input", "content": .string(text), "whenBusy": .string(whenBusy.rawValue)]
+        try await submit([.text(text)], whenBusy: whenBusy, requestId: requestId)
+    }
+
+    /// Admits user input made of text and images.
+    @discardableResult
+    public func submit(_ content: [ContentBlock], whenBusy: Conversation.WhenBusy = .followUp, requestId: String? = nil)
+        async throws -> Submission
+    {
+        let content: JSONValue =
+            if content.count == 1, let text = content[0].text { .string(text) } else { try JSONValue(encoding: content) }
+        var submission: JSONObject = ["type": "input", "content": content, "whenBusy": .string(whenBusy.rawValue)]
         if let requestId { submission["requestId"] = .string(requestId) }
         let id: SubmissionID = try await handle.call("conversationHandle.submit", ["submission": JSONValue.object(submission)])
         return Submission(harness: harness, id: id)

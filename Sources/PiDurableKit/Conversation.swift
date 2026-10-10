@@ -135,17 +135,32 @@ public struct Conversation: Sendable, Identifiable, Hashable {
     ///
     /// - Parameters:
     ///   - entry: The last entry the fork inherits.
+    ///   - task: The task that owns the fork; `nil` (the default) makes it ownerless.
     ///   - agent: Changes to the agent it inherits.
     ///   - initialize: Runs in the creating commit.
     public func fork(
-        at entry: EntryID, agent: AgentChange? = nil, initialize: (@Sendable (Transaction, ConversationID) async throws -> Void)? = nil
+        at entry: EntryID, ownedBy task: TaskID? = nil, agent: AgentChange? = nil,
+        initialize: (@Sendable (Transaction, ConversationID) async throws -> Void)? = nil
     ) async throws -> Conversation {
         try await harness.creating(initialize) { initializer in
-            try await self.call("conversation.fork", ["at": entry, "agent": agent, "initialize": initializer])
+            try await self.call("conversation.fork", ["at": entry, "agent": agent, "initialize": initializer, "ownerTask": task])
         }
     }
 
     // MARK: Reading
+
+    /// The conversation's identity, fork ancestry, and owner.
+    public func record() async throws -> ConversationRecord {
+        guard let record: ConversationRecord = try await call("conversation.record") else {
+            throw PiDurableError.notFound("Conversation \(id) does not exist")
+        }
+        return record
+    }
+
+    /// One entry by ID, or `nil` when there is none.
+    public func entry(_ id: EntryID) async throws -> Entry? {
+        try await call("conversation.entry", ["entry": id])
+    }
 
     /// The current view: active transcript and live state.
     public func view() async throws -> ConversationView {
@@ -186,13 +201,8 @@ public struct Conversation: Sendable, Identifiable, Hashable {
     /// The active entries and the model context the next request would send.
     ///
     /// - Parameter entry: The model context as of this earlier visible entry, the view `fork(at:)` would start with.
-    public func context(at entry: EntryID? = nil) async throws -> (entries: [Entry], messages: [Message]) {
-        struct Result: Decodable, Sendable {
-            let entries: [Entry]
-            let messages: [Message]
-        }
-        let result: Result = try await call("conversation.context", ["at": entry])
-        return (result.entries, result.messages)
+    public func context(at entry: EntryID? = nil) async throws -> ContextView {
+        try await call("conversation.context", ["at": entry])
     }
 
     /// The conversation's whole history, newest first, including entries before resets and forks' parents.
@@ -210,6 +220,42 @@ public struct Conversation: Sendable, Identifiable, Hashable {
         try await call(
             "conversation.entries",
             ["minEntryId": oldest, "maxEntryId": newest, "order": order, "limit": limit, "cursor": cursor])
+    }
+
+    // MARK: Built-in documents
+
+    private func builtin<Value: Decodable & Sendable>(_ kind: String, asOf entry: EntryID? = nil) async throws -> Value? {
+        let json: JSONValue = try await call("conversation.builtinDoc", ["doc": kind, "asOf": entry])
+        return json.isNull ? nil : try json.decode(as: Value.self)
+    }
+
+    /// The stored agent choices (`pi.agent`), or as of an earlier entry: `pi.agent` is rewindable, so this is the agent
+    /// a fork at `entry` would start with.
+    public func agentState(asOf entry: EntryID? = nil) async throws -> AgentState {
+        try await builtin("pi.agent", asOf: entry) ?? AgentState()
+    }
+
+    /// The running generation, tool calls, and compactions (`pi.live`).
+    public func liveState() async throws -> LiveState {
+        try await builtin("pi.live") ?? LiveState()
+    }
+
+    /// Queued submissions (`pi.inbox`).
+    public func inbox() async throws -> [InboxItem] {
+        let state: JSONValue? = try await builtin("pi.inbox")
+        return try state?["items"]?.decode(as: [InboxItem].self) ?? []
+    }
+
+    /// The conversation's own spend (`pi.usage`).
+    public func usage() async throws -> UsageState {
+        try await builtin("pi.usage") ?? UsageState()
+    }
+
+    /// The conversation's provider-facing session identity (`pi.provider`), forwarded to pi-ai as `sessionId` for
+    /// prompt caches and session affinity; `nil` for a legacy conversation before its first request.
+    public func providerSessionId() async throws -> String? {
+        let state: JSONValue? = try await builtin("pi.provider")
+        return state?["sessionId"]?.stringValue
     }
 
     // MARK: Documents

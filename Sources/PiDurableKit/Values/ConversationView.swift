@@ -14,6 +14,8 @@ public struct ConversationView: Decodable, Sendable, Hashable {
     public let usage: UsageState
     /// The stored agent choices (`pi.agent`).
     public let agent: AgentState
+    /// The provider-facing session identity (`pi.provider`).
+    public let providerSessionId: String?
     /// Every built-in document, raw, keyed by kind.
     public let documents: JSONObject
 
@@ -35,6 +37,7 @@ public struct ConversationView: Decodable, Sendable, Hashable {
         inbox = (try? docs["pi.inbox"]?["items"].map { try $0.decode(as: [InboxItem].self) }) ?? []
         usage = (try? docs["pi.usage"].map { try $0.decode(as: UsageState.self) }) ?? UsageState()
         agent = (try? docs["pi.agent"].map { try $0.decode(as: AgentState.self) }) ?? AgentState()
+        providerSessionId = docs["pi.provider"]?["sessionId"]?.stringValue
     }
 
     /// Whether a run is working on an input.
@@ -60,27 +63,9 @@ public struct LiveState: Decodable, Sendable, Hashable {
         public let inputs: [SubmissionID]
     }
 
-    public struct Generation: Decodable, Sendable, Hashable {
-        public let attempt: Int
-        /// The partial response, committed periodically while it streams.
-        public let message: AssistantMessage?
-        /// A durable backoff before the next attempt.
-        public let retry: Retry?
-    }
-
-    public struct Retry: Decodable, Sendable, Hashable {
-        /// When the next attempt starts.
-        public let at: Date
-        public let error: String
-
-        private enum CodingKeys: String, CodingKey { case at, error }
-
-        public init(from decoder: Decoder) throws {
-            let container = try decoder.container(keyedBy: CodingKeys.self)
-            at = try container.decodeMilliseconds(forKey: .at)
-            error = try container.decodeIfPresent(String.self, forKey: .error) ?? ""
-        }
-    }
+    public typealias Generation = GenerationStatus
+    public typealias Retry = RetryBackoff
+    public typealias Compaction = CompactionStatus
 
     /// One tool call of the current round.
     public struct ToolSlot: Decodable, Sendable, Hashable, Identifiable {
@@ -93,19 +78,17 @@ public struct LiveState: Decodable, Sendable, Hashable {
         public let name: String
         public let taskId: TaskID?
         public let status: Status
-        /// The output the tool streamed so far.
+        /// The output the tool streamed so far, within the tool's output limits.
         public let output: String?
+        /// Bytes of output the limits dropped.
+        public let droppedBytes: Int?
+        /// Lines of output the limits dropped.
+        public let droppedLines: Int?
         public let details: JSONValue?
-        /// The result entry, once done.
+        /// Diagnostics recorded with ``ToolCallContext/diagnostic(_:)``.
+        public let diagnostics: [ToolDiagnostic]?
+        /// The result entry, once done; absent when the tool task faulted or was orphaned.
         public let entry: EntryID?
-    }
-
-    public struct Compaction: Decodable, Sendable, Hashable {
-        public let taskId: TaskID
-        /// `manual`, `threshold`, or `overflow`.
-        public let reason: String
-        public let blocking: Bool
-        public let attempt: Int
     }
 
     /// Present exactly while the conversation is busy.

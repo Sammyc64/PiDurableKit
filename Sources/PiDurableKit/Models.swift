@@ -148,6 +148,12 @@ public final class Models: Sendable {
         try await perform("models.logout", ["provider": provider])
     }
 
+    /// Whether pi-ai can authenticate requests to `provider`: a stored API key or sign-in, or a provider that needs
+    /// none.
+    public func isConfigured(_ provider: ProviderID) async throws -> Bool {
+        try await call("models.isConfigured", ["provider": provider])
+    }
+
     /// The stored credential of a provider.
     public func credential(for provider: ProviderID) async throws -> Credential? {
         try await credentials.credential(for: provider)

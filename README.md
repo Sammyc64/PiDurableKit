@@ -48,29 +48,48 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 |---|---|
 | `createModels({ credentials })` + providers | `Models(credentials:)`, `models.register(CustomProvider(…))` |
 | `Harness.open(storage, { models, registry, settings })` | `Harness.open(.sqlite(at:), models:, extensions:, settings:)` |
-| `harness.root()`, `createConversation()`, `fork()` | `harness.root(agent:)`, `harness.createConversation(agent:)`, `conversation.fork(at:)` |
+| `harness.root()`, `createConversation()`, `fork()` | `harness.root(agent:)`, `harness.createConversation(ownedBy:agent:)`, `conversation.fork(at:ownedBy:)` |
+| `tx.scanConversations()`, `tx.conversation()`, `tx.entry()` | `harness.conversations(ownedBy:)`, `conversation.record()`, `conversation.entry(_:)` |
 | `conversation.submit({ type: "input", … })` | `conversation.submit("…", whenBusy:, requestId:)` |
 | `conversation.submit({ type: "write", … })` | `conversation.write(EntryDraft(…))` |
 | `submission.wait()`, `tx.entry(AssistantEntry, id)` | `submission.wait()`, `tx.entry(id)?.assistantMessage` |
+| `harness.submission(id)`, `abortSubmission(id, context, conversationId)` | `harness.submission(_:)`, `harness.abortSubmission(_:in:)` |
+| `conversation.context({ at })` → `head`, `entries`, `contributions`, `messages` | `conversation.context(at:)` → `ContextView` |
+| `EntryDraft.head`, `EntryDraft.edits` (`ContextEdit`) | `EntryDraft(kind:head: .itself / .entry(id), edits: [.omit(id), .replace(id, with:)])` |
 | `conversation.configure(change)` | `conversation.configure(AgentChange(…))` |
 | `defineExtension`, `defineTool`, `section`, `hook` | `Extension`, `Tool`, `PromptSection`, `Hook` |
-| `wrapTool`, `wrapSection` | `Wrap.tool`, `Wrap.section` |
+| `wrapTool`, `wrapSection` | `Wrap.tool(_:definition:prepareArguments:execute:)`, `Wrap.section` |
+| `hook(GenerationTask, { onYield })` with user content | `Hook.onYield` (text), `Hook.onYieldContent` (text and images) |
 | an extension written in JavaScript | `Extension(name, javaScript: source)` |
 | `defineTask`, `TaskRuntime` | `TaskType`, `Phase`, `TaskRun` |
 | `harness.commit()`, `conversation.commit()`, `Tx` | `harness.commit { tx in … }`, `conversation.commit { tx in … }`, `Transaction` |
-| `ToolExecutionApi` (`commit`, `conversation`, `memo`, …) | `ToolCallContext` |
+| `ToolExecutionApi` (`commit`, `conversation`, `memo`, `env`, `registry`, `outputWindow`, …) | `ToolCallContext` (`environment()`, `registry()`, `outputWindow`, `output(_:skipped:)`, …) |
+| `TaskRuntime` `env()`, `settings`, `registry` | `run.environment()`, `run.settings()`, `run.registry()` |
+| `registry.snapshot()`, `resolveSettings()`, `DEFAULT_*_POLICY` | `harness.registry()`, `harness.resolvedSettings()`, `Runtime.defaultSettings()` |
 | `conversation.watch()` / `viewState()` | `conversation.changes()` / `conversation.views()`, `conversation.view()` |
 | `watchEvents(harness, id)` → `snapshot`, `start(listener)` | `harness.watchEvents(id)` → `snapshot`, `for try await events in stream` |
 | `defineDoc`, `defineDocFamily` + `tx.doc()` | `Document(…, scope:, history:, keyed:, migrate:)`, `update(_:_:)`, `values(of:)` |
 | `defineEntry` | `EntryType`, `conversation.write(_:_:)`, `entry.data(as:)` |
+| `UserEntry`, `AssistantEntry`, `ToolResultEntry`, `CompactionEntry`, … | `EntryType.user`, `.assistant`, `.toolResult`, `.compaction`, …, `entry.is(_:)` |
+| `AgentDoc`, `LiveDoc`, `InboxDoc`, `UsageDoc`, `ProviderDoc` | `conversation.agentState(asOf:)`, `liveState()`, `inbox()`, `usage()`, `providerSessionId()` |
+| `tx.latestHeadMarker()`, `tx.submissionByRequest()` | `tx.latestHeadMarker(in:)`, `tx.submission(in:requestId:)` |
+| `tx.createSubmission()`, `settleSubmission()`, `placeSubmission()` | `tx.createSubmission(_:)`, `tx.settleSubmission(_:_:)`, `tx.placeSubmission(_:at:)` |
 | `taskGraph()`, `watchTaskGraph()`, `inspect()`, `getTask()` | `taskGraph()`, `taskGraphs()`, `inspect()`, `task(_:)` |
-| `HarnessOptions.env`, `CodingTools` | `ExecutionEnvironment.directory(_:)` / `.perConversation { target in … }`, `Extension.codingTools()` |
-| `harness.subscribeCommits()` | `harness.commits()` |
+| `HarnessOptions.env`, `CodingTools` | `ExecutionEnvironment.directory(_:)` / `.custom(_:)` / `.local` (macOS) / `.perConversation { target in … }`, `Extension.codingTools(shell:)` |
+| `ExecutionEnv` (`readTextFile`, `openBinaryReader`, `exec`, `watch`, …) | `ExecutionEnv` from `harness.environment(for:)` or a call's `environment()` |
+| a custom `ExecutionEnv` | `CustomExecutionEnvironment` |
+| `createReadTool()`, `createBashTool({ commandPrefix, prepare })`, `createPowerShellTool()` | `Extension.builtinTools(name:_:)` with `.read`, `.write`, `.edit`, `.bash(commandPrefix:prepare:)`, `.powerShell(…)` |
+| `harness.subscribeCommits()`, `subscribeClose()` | `harness.commits()`, `harness.closing()` |
+| `createSession(storage)` | `Session.open(_:)` |
+| a custom `Storage` | `Storage.custom(_:)` with your `CustomStorage` |
+| `registerStorageConformance`, `registerEnvConformance` | `Runtime.runStorageConformance(_:)`, `Runtime.runEnvironmentConformance(_:)` |
+| Chord `apply(value, ops)` | `Runtime.applyOperations(_:to:)` |
 | `SqliteStorage` over a `SqliteDatabase` facade | `Storage.sqlite(database:)` with your `SQLiteDatabase` |
 | pi-ai `models.completeSimple()`, `streamSimple()` | `models.complete(_:context:options:)`, `models.stream(_:context:options:)` |
-| `ROOT_CONVERSATION_ID`, `ReadAfterWrite`, `StorageRejected` | `ConversationID.root`, `PiDurableError.readAfterWrite`, `.storageRejected` |
+| `ROOT_CONVERSATION_ID`, `INSTRUCTIONS_KEY` | `ConversationID.root`, `PromptSection.instructionsKey` |
+| `ReadAfterWrite`, `StorageRejected`, `ConversationBusy`, `FileError`, `ExecutionError`, `Jsonl*Error` | `PiDurableError.readAfterWrite`, `.storageRejected`, `.conversationBusy(id)`, `.file(code:message:path:)`, `.execution(code:message:spillPath:)`, `.jsonlCorrupted`, `.jsonlPoisoned` |
 | `conversationCreated`, `init`, `now`, `onReport` | `onConversationCreated:`, `initialize:`, `clock:`, `onReport:` |
-| `JsonlStorage`, `models.refresh()` | `Storage.jsonl(at:)`, `models.refresh()` |
+| `JsonlStorage`, `models.refresh()`, `models.getAuth()` | `Storage.jsonl(at:)` / `.jsonl(in:directory:)`, `models.refresh()`, `models.isConfigured(_:)` |
 
 ## Tools
 
@@ -253,13 +272,35 @@ let harness = try await Harness.open(
 ```
 
 The agent sees the directory as `/` and cannot leave it; a conversation's `cwd` is a path inside it. There is no
-shell on iOS, so `bash` is not included. To give each conversation its own sandbox, choose it per conversation, like
-pi-durable's `env` function:
+shell on iOS, so `bash` is not included. On macOS, `.directory(url, shell: true)` adds a shell (commands run in the
+directory's real location and are not confined), and `.local` is the Mac's own file system and shell, like pi-durable's
+`NodeExecutionEnv`; pair either with `Extension.codingTools(shell: true)` or
+`Extension.builtinTools(name: "shell", [.bash(commandPrefix: "source .venv/bin/activate")])`. To give each
+conversation its own sandbox, choose it per conversation, like pi-durable's `env` function:
 
 ```swift
 environment: .perConversation { target in
     let project = try await target.document(projectDocument).folder
     return project.isEmpty ? nil : .directory(projects.appending(path: project))
+}
+```
+
+Your own file system, such as a remote machine or an in-memory store, implements `CustomExecutionEnvironment` (file
+operations, and optionally `run` for commands) and plugs in with `.custom(_:)`. Check it with
+`Runtime.shared.runEnvironmentConformance { .custom(MyFileSystem()) }`, pi-durable's own conformance suite.
+
+The app can use a conversation's environment directly, to show its files or run a command in its directory, and tools,
+task phases, and sections reach the one built for their call:
+
+```swift
+let env = try await harness.environment(for: conversation.id)!
+let files = try await env.listDirectory(".")
+try await env.write("notes", to: "notes.md")
+let result = try await env.run(.argv(["git", "status", "--porcelain"])) { chunk in print(chunk.stream, chunk.text) }
+for try await change in env.watch([WatchTarget("/", recursive: true)]) { reload(change) }
+
+let tool = Tool("count_files", description: "Count files") { (call: ToolCallContext) in
+    "\(try await call.environment()?.listDirectory(".").count ?? 0)"
 }
 ```
 
@@ -324,7 +365,7 @@ let root = try await harness.root()          // the same root as last time
 let submission = try await root.submit("Hello", requestId: "greeting-1")
 // After a crash, the same requestId finds the same submission instead of submitting twice:
 let again = try await root.submit("Hello", requestId: "greeting-1")
-let settled = try await harness.submission(submission.id).wait()
+let settled = try await harness.submission(submission.id)?.wait()
 ```
 
 Install the same extensions after a restart so pending tool calls can resume.
@@ -370,7 +411,18 @@ until it finishes.
 ### Replicating a harness
 
 `harness.commits()` delivers every commit's changes as soon as they are stored: conversations, entries, tasks,
-submissions, and document operations.
+submissions, and document operations. `Runtime.applyOperations(_:to:)` applies a document change's operations to the
+previous value.
+
+### Other storage and plain sessions
+
+`Storage.jsonl(in:directory:)` keeps pi-durable's JSONL storage on a `CustomExecutionEnvironment`, for example a synced
+or encrypted file system. `Storage.custom(_:)` takes pi-durable's whole `Storage` interface implemented in Swift
+(`CustomStorage`, records as JSON); validate it, or your `SQLiteDatabase`, with
+`Runtime.shared.runStorageConformance { .custom(MyStorage()) }`.
+
+`Session.open(_:)` opens a plain pi-durable session (`createSession`) without agents or a task scheduler: atomic commits
+of conversations, entries, and documents, the same storage formats, and its commit stream.
 
 ## Models and providers
 
@@ -451,8 +503,10 @@ let root = try await harness.root(agent: AgentChange(model: faux.model))
 | `crypto.subtle.digest` (PKCE) | CryptoKit |
 | `node:http` (OAuth loopback redirect) | Network.framework `NWListener` on the loopback interface |
 | pi-ai `CredentialStore` | `CredentialStore` (Keychain, memory, or yours) |
+| pi-durable `ExecutionEnv` (sandbox files) | POSIX file calls on the sandbox's real directory |
+| `Shell.exec` (macOS `.local`, `.directory(_:shell:)`) | `posix_spawn` in its own process group |
 
-`TextEncoder`/`TextDecoder`, `AbortController`, `EventTarget`, `Blob`/`FormData`, and `Headers`/`Request`/`Response` are implemented in TypeScript; `ReadableStream` comes from `web-streams-polyfill` and newer ECMAScript built-ins from `core-js`. All JavaScript runs on one serial queue per `Runtime`, which is also the executor of the actor that owns the `JSContext`. Swift and JavaScript talk through a small JSON bridge (`JS/src/bridge.ts`).
+`TextEncoder`/`TextDecoder`, `AbortController`, `EventTarget`, `Blob`/`FormData`, and `Headers`/`Request`/`Response` are implemented in TypeScript; `ReadableStream` comes from `web-streams-polyfill` and newer ECMAScript built-ins from `core-js`. All JavaScript runs on one serial queue per `Runtime`, which is also the executor of the actor that owns the `JSContext`. Swift and JavaScript talk through a small JSON bridge (`JS/src/bridge/`).
 
 Use `Runtime(configuration:)` to give agents their own JavaScript thread or a custom `URLSessionConfiguration`, and pass it to `Models(runtime:)`.
 

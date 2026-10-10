@@ -204,7 +204,7 @@ public struct TaskRun<Input: Codable & Sendable, Checkpoint: TaskCheckpoint, Res
     /// Commits on the session line. Returning a state replaces the task's state in the same commit; returning `nil`
     /// leaves it unchanged. `tx.createTask` defaults to the task's conversation.
     public func commit(_ body: @escaping @Sendable (Transaction, TaskRecord) async throws -> NextState<Checkpoint, Result>?) async throws {
-        let _: Void = try await Transaction.run(harness: harness) { commit in
+        let _: Void = try await Transaction.run(engine: harness.engine) { commit in
             try await handle.perform("scope.commit", ["commit": commit])
         } body: { transaction, extra in
             let current = try (extra["current"] ?? .null).decode(as: TaskRecord.self)
@@ -267,14 +267,19 @@ public struct TaskRun<Input: Codable & Sendable, Checkpoint: TaskCheckpoint, Res
     }
 
     /// A conversation's active entries and model context, optionally as of entry `at`.
-    public func context(of conversation: ConversationID, at entry: EntryID? = nil) async throws -> (entries: [Entry], messages: [Message]) {
-        let view: ContextResult = try await handle.call("scope.context", ["conversation": conversation, "at": entry])
-        return (view.entries, view.messages)
+    public func context(of conversation: ConversationID, at entry: EntryID? = nil) async throws -> ContextView {
+        try await handle.call("scope.context", ["conversation": conversation, "at": entry])
     }
 
     /// The task's conversation's agent.
     public func agent() async throws -> Agent {
         try await handle.call("scope.agent")
+    }
+
+    /// The task's conversation's execution environment (pi-durable `runtime.env()`); `nil` without one. Valid until
+    /// the phase handler returns.
+    public func environment() async throws -> ExecutionEnv? {
+        try await handle.environment()
     }
 
     /// The harness clock.
@@ -496,14 +501,44 @@ public struct TaskGraph: Decodable, Sendable, Hashable {
 
 /// Live work and what the scheduler would do with it (pi-durable `HarnessInspection`).
 public struct HarnessInspection: Decodable, Sendable, Hashable {
+    /// Whether the task scheduler runs.
+    public enum Scheduling: String, Decodable, Sendable {
+        /// Not started yet; see ``Harness/resume()``.
+        case paused
+        case running
+        case closing
+    }
+
     public struct Task: Decodable, Sendable, Hashable {
+        /// What the scheduler would do with a live task (pi-durable `TaskInspection.state`).
+        public enum State: Sendable, Hashable {
+            /// An invocation is running it.
+            case running
+            /// The next scheduling pass reserves it; `migrates` when its definition is newer and has `migrate`.
+            case ready(migrates: Bool)
+            /// Waits for these live tasks.
+            case waiting(on: [TaskID])
+            /// Its outcome is held until the work it owns drains.
+            case completing
+            /// No installed definition can take it: `missing_task`, `task_too_old`, or `migration_failed`, with the
+            /// migration's error. Aborting it settles it as orphaned.
+            case blocked(reason: String, error: String?)
+        }
+
         public let record: TaskRecord
-        /// `running`, `ready`, `waiting`, `completing`, or `blocked`.
-        public let state: String
+        public let state: State
+
         /// Why a blocked task cannot run, such as `missing_task`.
-        public let blockedReason: String?
+        public var blockedReason: String? {
+            if case .blocked(let reason, _) = state { return reason }
+            return nil
+        }
+
         /// The tasks a waiting task waits for.
-        public let waitingOn: [TaskID]
+        public var waitingOn: [TaskID] {
+            if case .waiting(let on) = state { return on }
+            return []
+        }
 
         private enum CodingKeys: String, CodingKey { case record, state }
 
@@ -511,20 +546,47 @@ public struct HarnessInspection: Decodable, Sendable, Hashable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             record = try container.decode(TaskRecord.self, forKey: .record)
             let state = try container.decode(JSONValue.self, forKey: .state)
-            self.state = state["kind"]?.stringValue ?? ""
-            blockedReason = state["reason"]?.stringValue
-            waitingOn = (try? (state["on"] ?? []).decode(as: [TaskID].self)) ?? []
+            switch state["kind"]?.stringValue {
+            case "running": self.state = .running
+            case "ready": self.state = .ready(migrates: state["migrates"]?.boolValue ?? false)
+            case "waiting": self.state = .waiting(on: (try? (state["on"] ?? []).decode(as: [TaskID].self)) ?? [])
+            case "completing": self.state = .completing
+            default:
+                let error = state["error"].flatMap { $0.isNull ? nil : ($0["message"]?.stringValue ?? $0.stringValue ?? $0.jsonString) }
+                self.state = .blocked(reason: state["reason"]?.stringValue ?? "", error: error)
+            }
         }
     }
 
-    /// `paused`, `running`, or `closing`.
-    public let scheduling: String
+    public let scheduling: Scheduling
     public let tasks: [Task]
     /// Queued and placed submissions.
     public let submissions: [SubmissionRecord]
 }
 
-struct ContextResult: Decodable, Sendable {
-    let entries: [Entry]
-    let messages: [Message]
+/// A task's durable status (pi-durable `TaskState.status`), for ``TaskQuery``.
+public enum TaskStatus: String, Codable, Sendable, CaseIterable {
+    case pending, running, waiting, completing, terminal
+}
+
+/// A conversation's raw active transcript and the model context derived from it (pi-durable `ContextView`).
+public struct ContextView: Decodable, Sendable, Hashable {
+    /// The newest applicable head marker (a reset or compaction), if any.
+    public let head: Entry?
+    /// The raw active entries: the head marker, then the entries from its head through the tail.
+    public let entries: [Entry]
+    /// Per entry of ``entries``, its model messages after edits and excluded stop reasons, before tool result ordering.
+    public let contributions: [[Message]]
+    /// The model context of the next provider request.
+    public let messages: [Message]
+
+    private enum CodingKeys: String, CodingKey { case head, entries, contributions, messages }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        head = try container.decodeIfPresent(Entry.self, forKey: .head)
+        entries = try container.decodeIfPresent([Entry].self, forKey: .entries) ?? []
+        contributions = try container.decodeIfPresent([[Message]].self, forKey: .contributions) ?? []
+        messages = try container.decodeIfPresent([Message].self, forKey: .messages) ?? []
+    }
 }

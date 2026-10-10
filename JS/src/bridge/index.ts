@@ -6,6 +6,8 @@ import "./tx.ts";
 import "./scopes.ts";
 import "./extensions.ts";
 import "./harness.ts";
+import "./envapi.ts";
+import "./storage.ts";
 import { register } from "./core.ts";
 import { VERSIONS } from "../versions.ts";
 

@@ -7,6 +7,9 @@ import {
 	type Cursor,
 	type EntryDraft,
 	type EntryId,
+	type SubmissionCreate,
+	type SubmissionId,
+	type SubmissionSettlement,
 	type TaskId,
 	type TaskOwnership,
 	type Tx,
@@ -26,7 +29,7 @@ function txOf(args: Args): TxHandle {
 	return handle<TxHandle>(args.handle);
 }
 
-function conversationOwnership(args: Args): ConversationOwnership {
+export function conversationOwnership(args: Args): ConversationOwnership {
 	return args.ownerTask === undefined || args.ownerTask === null ? { kind: "ownerless" } : { kind: "task", taskId: args.ownerTask as TaskId };
 }
 
@@ -62,6 +65,16 @@ register({
 	"tx.scanTasks": async (args) => {
 		const page = await txOf(args).tx.scanTasks(args.query ?? {}, args.limit ?? 100, (args.cursor ?? undefined) as Cursor | undefined);
 		return { items: page.items.map(describeTask), next: page.next };
+	},
+	"tx.latestHeadMarker": async (args) => (await txOf(args).tx.latestHeadMarker(args.conversation as ConversationId)) ?? null,
+	"tx.submissionByRequest": async (args) =>
+		(await txOf(args).tx.submissionByRequest(args.conversation as ConversationId, args.requestId)) ?? null,
+	"tx.createSubmission": (args) => txOf(args).tx.createSubmission(args.submission as SubmissionCreate),
+	"tx.settleSubmission": (args) => {
+		txOf(args).tx.settleSubmission(args.submission as SubmissionId, args.settlement as SubmissionSettlement);
+	},
+	"tx.placeSubmission": (args) => {
+		txOf(args).tx.placeSubmission(args.submission as SubmissionId, args.entry as EntryId);
 	},
 	"tx.createConversation": (args) => txOf(args).tx.createConversation({ ownership: conversationOwnership(args) }),
 	"tx.forkConversation": (args) =>

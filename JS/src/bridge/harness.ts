@@ -1,41 +1,45 @@
 // Harnesses, conversations, submissions, documents, and task inspection.
 import type { Context } from "@earendil-works/chord";
 import {
+	AgentDoc,
+	InboxDoc,
+	LiveDoc,
+	ProviderDoc,
+	UsageDoc,
 	type ConversationCreateOptions,
+	type ConversationId,
 	type ConversationInit,
 	createRegistry,
 	type EntryId,
 	type Extension,
 	Harness,
 	type HarnessSettings,
-	MemoryStorage,
-	type Storage,
 	type SubmissionDraft,
 	type SubmissionId,
 	type TaskId,
 	watchEvents,
 	type WatchHandle,
 } from "@earendil-works/pi-durable";
-import { JsonlStorage } from "@earendil-works/pi-durable/storage/jsonl";
-import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { type Args, emit, finish, host, hostSync, openStream, register, withHandle } from "./core.ts";
+import { type Args, emit, finish, host, hostSync, openStream, register, serializeError, withHandle } from "./core.ts";
 import { applyDeep, draftOf, readDoc, retireDoc, watchArguments } from "./docs.ts";
-import { SandboxEnv } from "./env.ts";
+import { environmentOf } from "./env.ts";
 import { withScope } from "./scopes.ts";
-import { HostSqliteDatabase } from "./sqlite.ts";
+import { openStorage } from "./storage.ts";
 import { buildExtension } from "./extensions.ts";
 import { modelsState } from "./models.ts";
 import {
 	agentChange,
 	conversation,
 	describeAgent,
+	describeRegistry,
+	describeSettings,
 	describeTask,
 	type HarnessState,
 	harnessState,
 	harnesses,
+	resolveSettings,
 } from "./state.ts";
-import { runSwiftCommit, type TxHandle } from "./tx.ts";
+import { conversationOwnership, runSwiftCommit, type TxHandle } from "./tx.ts";
 
 /** Live settings: every read goes to the newest value Swift sent. */
 function liveSettings(state: HarnessState): HarnessSettings {
@@ -74,19 +78,6 @@ function liveSettings(state: HarnessState): HarnessSettings {
 	};
 }
 
-async function openStorage(spec: Args, context: Context): Promise<Storage> {
-	switch (spec.kind) {
-		case "sqlite":
-			return openNodeSqliteStorage(spec.path);
-		case "jsonl":
-			return JsonlStorage.open("/", new SandboxEnv(spec.path), context, { fsync: spec.fsync === true });
-		case "database":
-			return SqliteStorage.open(new HostSqliteDatabase(spec.database));
-		default:
-			return new MemoryStorage();
-	}
-}
-
 function initializer(state: HarnessState, args: Args, context: Context): ConversationInit | undefined {
 	if (args.initialize === undefined || args.initialize === null) return undefined;
 	return (tx, conversationId) => runSwiftCommit(tx, state, args.initialize, context, { conversation: conversationId }).then(() => undefined);
@@ -94,7 +85,7 @@ function initializer(state: HarnessState, args: Args, context: Context): Convers
 
 function createOptions(state: HarnessState, args: Args, context: Context): ConversationCreateOptions {
 	return {
-		ownership: { kind: "ownerless" },
+		ownership: conversationOwnership(args),
 		agent: agentChange(state, args.agent),
 		init: initializer(state, args, context),
 	};
@@ -117,31 +108,27 @@ register({
 		const registry = createRegistry();
 		const state = { id: args.id, registry, settings: { value: args.settings ?? {} } } as HarnessState;
 		for (const spec of args.extensions as Args[]) registry.install(buildExtension(state, spec));
+		state.harnessSettings = liveSettings(state);
 		const storage = await openStorage(args.storage, context);
 		const environment = args.environment as Args | null | undefined;
+		if (environment?.perConversation) {
+			// The app picks the environment of each conversation, as pi-durable's `env` function does.
+			state.env = async ({ conversationId, cwd, read }, context) => {
+				const chosen = await withScope({ harness: state, reader: read }, (scope) =>
+					host<Args | null>("harness.environment", { harness: args.id, handle: scope, conversationId, cwd: cwd ?? null }, context),
+				);
+				return chosen === null ? undefined : environmentOf(chosen, cwd);
+			};
+		} else if (environment != null) {
+			state.env = ({ cwd }) => environmentOf(environment, cwd);
+		}
 		state.harness = await Harness.open(
 			storage,
 			{
 				models,
 				registry,
-				settings: liveSettings(state),
-				...(environment?.root
-					? { env: ({ cwd }) => new SandboxEnv(environment.root, cwd ?? "/") }
-					: environment?.perConversation
-						? {
-								// The app picks the environment of each conversation, as pi-durable's `env` function does.
-								env: async ({ conversationId, cwd, read }, context) => {
-									const chosen = await withScope({ harness: state, reader: read }, (scope) =>
-										host<Args | null>(
-											"harness.environment",
-											{ harness: args.id, handle: scope, conversationId, cwd: cwd ?? null },
-											context,
-										),
-									);
-									return chosen === null ? undefined : new SandboxEnv(chosen.root, cwd ?? "/");
-								},
-							}
-						: {}),
+				settings: state.harnessSettings,
+				...(state.env === undefined ? {} : { env: state.env }),
 				...(args.conversationCreated
 					? {
 							conversationCreated: (tx, record) =>
@@ -179,16 +166,42 @@ register({
 	"harness.uninstall": (args) => {
 		harnessState(args.harness).registry.uninstall({ name: args.name } as Extension);
 	},
+	"harness.registry": (args) => describeRegistry(harnessState(args.harness).registry.snapshot()),
+	"harness.settings": (args) => {
+		const state = harnessState(args.harness);
+		return describeSettings(resolveSettings(state.harnessSettings ?? {}));
+	},
+	"settings.defaults": () => describeSettings(resolveSettings({})),
 	"harness.extensions": (args) => harnessState(args.harness).registry.snapshot().installed().map((extension) => extension.name),
 	"harness.waitForIdle": (args, context) => harnessState(args.harness).harness.waitForIdle(context),
 	"harness.usage": (args, context) => harnessState(args.harness).harness.usage(context),
 	"harness.inspect": async (args, context) => {
 		const inspection = await harnessState(args.harness).harness.inspect(context);
-		return { ...inspection, tasks: inspection.tasks.map((task) => ({ ...task, record: describeTask(task.record) })) };
+		return {
+			...inspection,
+			tasks: inspection.tasks.map((task) => ({
+				...task,
+				record: describeTask(task.record),
+				// A blocked task's migration error is an Error object, which JSON would turn into `{}`.
+				state: task.state.kind === "blocked" && task.state.error !== undefined ? { ...task.state, error: serializeError(task.state.error) } : task.state,
+			})),
+		};
 	},
 	"harness.conversations": async (args, context) => {
 		const { harness } = harnessState(args.harness);
-		return harness.commit((tx) => tx.scanConversations({}, args.limit ?? 100, args.cursor ?? undefined), context);
+		return harness.commit(
+			(tx) =>
+				tx.scanConversations(
+					{
+						...(args.ownerConversation == null ? {} : { ownerConversationId: args.ownerConversation }),
+						...(args.ownerTask == null ? {} : { ownerTaskId: args.ownerTask }),
+						...(args.order == null ? {} : { order: args.order }),
+					},
+					args.limit ?? 100,
+					args.cursor ?? undefined,
+				),
+			context,
+		);
 	},
 	"harness.task": async (args, context) => describeTask(await harnessState(args.harness).harness.getTask(args.task as TaskId, context)),
 	"harness.waitForTask": async (args, context) =>
@@ -256,7 +269,7 @@ register({
 	"conversation.waitForIdle": async (args, context) => (await conversation(args, context)).waitForIdle(context),
 	"conversation.context": async (args, context) => {
 		const view = await (await conversation(args, context)).context(context, args.at == null ? undefined : { at: args.at });
-		return { entries: view.entries, messages: view.messages };
+		return view;
 	},
 	"conversation.entries": async (args, context) =>
 		(await conversation(args, context)).entries(
@@ -315,6 +328,30 @@ register({
 		);
 	},
 
+	/** A built-in conversation document: `pi.agent` (optionally as of an entry), `pi.live`, `pi.inbox`, `pi.usage`, `pi.provider`. */
+	"conversation.builtinDoc": async (args, context) => {
+		const { harness } = harnessState(args.harness);
+		const id = args.conversation as ConversationId;
+		switch (args.doc) {
+			case "pi.agent":
+				return (
+					(args.asOf == null
+						? await harness.snapshot(AgentDoc, id, context)
+						: await harness.snapshotAsOf(AgentDoc, id, args.asOf as EntryId, context)) ?? null
+				);
+			case "pi.live":
+				return (await harness.snapshot(LiveDoc, id, context)) ?? null;
+			case "pi.inbox":
+				return (await harness.snapshot(InboxDoc, id, context)) ?? null;
+			case "pi.usage":
+				return (await harness.snapshot(UsageDoc, id, context)) ?? null;
+			case "pi.provider":
+				return (await harness.snapshot(ProviderDoc, id, context)) ?? null;
+			default:
+				throw Object.assign(new Error(`Unknown built-in document ${args.doc}`), { name: "NotFound" });
+		}
+	},
+
 	// Submissions
 
 	"submission.status": async (args, context) => {
@@ -327,7 +364,11 @@ register({
 		return submission.wait(context);
 	},
 	"submission.abort": async (args, context) =>
-		harnessState(args.harness).harness.abortSubmission(args.submission as SubmissionId, context),
+		harnessState(args.harness).harness.abortSubmission(
+			args.submission as SubmissionId,
+			context,
+			args.conversation == null ? undefined : (args.conversation as ConversationId),
+		),
 
 	// Documents
 

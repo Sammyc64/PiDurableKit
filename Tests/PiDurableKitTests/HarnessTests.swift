@@ -108,7 +108,7 @@ let weatherTool = Tool(
         let root = try await setup.root(AgentChange(instructions: "Answer in French."))
         _ = try await ask(root, "Hello")
 
-        let (_, messages) = try await root.context()
+        let messages = try await root.context().messages
         let systems = messages.compactMap { message -> SystemMessage? in
             if case .system(let system) = message { return system }
             return nil

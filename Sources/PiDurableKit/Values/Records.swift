@@ -32,6 +32,8 @@ public struct Entry: Codable, Sendable, Hashable, Identifiable {
     public let data: JSONValue?
     /// The first entry of the active context this entry selects (resets and compactions).
     public let head: EntryID?
+    /// Context-only overrides of earlier visible entries.
+    public let edits: [ContextEdit]?
     /// The task that appended this entry.
     public let byTaskId: TaskID?
 
@@ -60,17 +62,92 @@ public struct Entry: Codable, Sendable, Hashable, Identifiable {
     public var text: String { (model ?? []).map(\.text).joined(separator: "\n") }
 }
 
-/// A new transcript entry written by the app, without asking the model anything.
-public struct EntryDraft: Encodable, Sendable {
+/// A new transcript entry written by the app, without asking the model anything (pi-durable `EntryDraft`).
+public struct EntryDraft: Encodable, Sendable, Hashable {
+    /// Where the active context starts once this entry is written.
+    public enum Head: Sendable, Hashable {
+        /// At this entry itself, like a reset: the model no longer sees older entries.
+        case itself
+        /// At an earlier visible entry, like a compaction summary that keeps the entries from `entry` on.
+        case entry(EntryID)
+    }
+
     public var kind: EntryKind
     public var data: JSONValue?
     /// Messages contributed to the model's context, if any.
     public var model: [Message]?
+    /// Makes this entry a head marker that starts a new active context.
+    public var head: Head?
+    /// Overrides of earlier visible entries' contributions to the model's context.
+    public var edits: [ContextEdit]?
 
-    public init(kind: EntryKind, data: JSONValue? = nil, model: [Message]? = nil) {
+    public init(
+        kind: EntryKind, data: JSONValue? = nil, model: [Message]? = nil, head: Head? = nil, edits: [ContextEdit]? = nil
+    ) {
         self.kind = kind
         self.data = data
         self.model = model
+        self.head = head
+        self.edits = edits
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: AnyKey.self)
+        try container.encode(kind, forKey: AnyKey("kind"))
+        try container.encodeIfPresent(data, forKey: AnyKey("data"))
+        try container.encodeIfPresent(model, forKey: AnyKey("model"))
+        switch head {
+        case .itself: try container.encode("self", forKey: AnyKey("head"))
+        case .entry(let id): try container.encode(id, forKey: AnyKey("head"))
+        case nil: break
+        }
+        try container.encodeIfPresent(edits, forKey: AnyKey("edits"))
+    }
+}
+
+/// An immutable override of one visible entry's contribution to the model's context (pi-durable `ContextEdit`).
+public struct ContextEdit: Codable, Sendable, Hashable {
+    public enum Action: Sendable, Hashable {
+        /// The model no longer sees the target's messages.
+        case omit
+        /// The model sees these messages instead of the target's.
+        case replace([Message])
+    }
+
+    /// The entry whose messages are omitted or replaced.
+    public var target: EntryID
+    public var action: Action
+
+    public init(target: EntryID, action: Action) {
+        self.target = target
+        self.action = action
+    }
+
+    public static func omit(_ target: EntryID) -> ContextEdit { ContextEdit(target: target, action: .omit) }
+    public static func replace(_ target: EntryID, with messages: [Message]) -> ContextEdit {
+        ContextEdit(target: target, action: .replace(messages))
+    }
+
+    private enum CodingKeys: String, CodingKey { case target, action, messages }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        target = try container.decode(EntryID.self, forKey: .target)
+        switch try container.decode(String.self, forKey: .action) {
+        case "replace": action = .replace(try container.decodeIfPresent([Message].self, forKey: .messages) ?? [])
+        default: action = .omit
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(target, forKey: .target)
+        switch action {
+        case .omit: try container.encode("omit", forKey: .action)
+        case .replace(let messages):
+            try container.encode("replace", forKey: .action)
+            try container.encode(messages, forKey: .messages)
+        }
     }
 }
 
@@ -169,26 +246,33 @@ public struct SubmissionRecord: Codable, Sendable, Hashable, Identifiable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(id, forKey: .id)
-        try container.encode(conversationId, forKey: .conversationId)
-        try container.encodeIfPresent(requestId, forKey: .requestId)
-        try container.encode(type, forKey: .type)
-        switch status {
+        var container = encoder.container(keyedBy: AnyKey.self)
+        try container.encode(id, forKey: AnyKey("id"))
+        try container.encode(conversationId, forKey: AnyKey("conversationId"))
+        try container.encodeIfPresent(requestId, forKey: AnyKey("requestId"))
+        try container.encode(type, forKey: AnyKey("type"))
+        try status.encode(into: &container)
+    }
+}
+
+extension SubmissionRecord.Status {
+    /// Writes `status` and its fields (`entry`, `answer`, `reason`, `detail`).
+    func encode(into container: inout KeyedEncodingContainer<AnyKey>) throws {
+        switch self {
         case .queued:
-            try container.encode("queued", forKey: .status)
+            try container.encode("queued", forKey: AnyKey("status"))
         case .placed(let entry):
-            try container.encode("placed", forKey: .status)
-            try container.encode(entry, forKey: .entry)
+            try container.encode("placed", forKey: AnyKey("status"))
+            try container.encode(entry, forKey: AnyKey("entry"))
         case .done(let entry, let answer):
-            try container.encode("done", forKey: .status)
-            try container.encode(entry, forKey: .entry)
-            try container.encodeIfPresent(answer, forKey: .answer)
+            try container.encode("done", forKey: AnyKey("status"))
+            try container.encode(entry, forKey: AnyKey("entry"))
+            try container.encodeIfPresent(answer, forKey: AnyKey("answer"))
         case .unanswered(let entry, let reason, let detail):
-            try container.encode("unanswered", forKey: .status)
-            try container.encodeIfPresent(entry, forKey: .entry)
-            try container.encode(reason, forKey: .reason)
-            try container.encodeIfPresent(detail, forKey: .detail)
+            try container.encode("unanswered", forKey: AnyKey("status"))
+            try container.encodeIfPresent(entry, forKey: AnyKey("entry"))
+            try container.encode(reason, forKey: AnyKey("reason"))
+            try container.encodeIfPresent(detail, forKey: AnyKey("detail"))
         }
     }
 }

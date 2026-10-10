@@ -306,7 +306,7 @@ let todosDocument = Document("app.todos", initial: Todos())
         let fast = Tool("slow", description: "Slow", replay: .safe) { _ in "fast done" }
         let setup = try await FauxSetup.make(.sqlite(at: url), extensions: [Extension("slow", tools: [fast])])
         try await setup.faux.append(.text("Finished after restart"))
-        let answer = try await answer(of: setup.harness.submission(submissionID))
+        let answer = try await answer(of: try #require(try await setup.harness.submission(submissionID)))
         #expect(answer.text == "Finished after restart")
         let root = try await setup.root()
         let result = try #require(try await root.view().entries.first { $0.kind == .toolResult }?.toolResult)

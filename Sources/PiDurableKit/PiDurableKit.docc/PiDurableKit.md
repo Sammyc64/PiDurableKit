@@ -33,6 +33,8 @@ if case .done(_, let answer?) = settled.status {
 - ``Conversation``
 - ``Submission``
 - ``Storage``
+- ``Session``
+- ``CustomStorage``
 
 ### Bundled pi-durable
 
@@ -56,6 +58,9 @@ if case .done(_, let answer?) = settled.status {
 - ``PromptSection``
 - ``Hook``
 - ``Wrap``
+- ``ToolDefinition``
+- ``BuiltinTool``
+- ``RegistrySnapshot``
 - <doc:JavaScriptExtensions>
 
 ### Agents
@@ -63,13 +68,23 @@ if case .done(_, let answer?) = settled.status {
 - ``AgentChange``
 - ``Agent``
 - ``Settings``
+
+### Execution environments
+
 - ``ExecutionEnvironment``
+- ``ExecutionEnv``
+- ``CustomExecutionEnvironment``
+- ``FileInfo``
+- ``ShellCommand``
 
 ### State
 
 - <doc:Documents>
 - ``Document``
 - ``EntryType``
+- ``EntryDraft``
+- ``ContextEdit``
+- ``ContextView``
 - ``Transaction``
 
 ### Durable tasks
@@ -85,3 +100,10 @@ if case .done(_, let answer?) = settled.status {
 - ``ConversationView``
 - ``AgentEventStream``
 - ``CommitPublication``
+- ``LiveState``
+- ``HarnessInspection``
+
+### Testing
+
+- ``ConformanceResult``
+- ``FauxProvider``

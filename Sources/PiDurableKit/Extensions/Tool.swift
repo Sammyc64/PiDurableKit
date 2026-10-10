@@ -17,7 +17,7 @@ import Foundation
 /// `interrupted` error result. Throwing gives the model an error result.
 public struct Tool: Sendable, Identifiable {
     /// Whether an interrupted call may run again after a restart.
-    public enum Replay: String, Sendable, Encodable {
+    public enum Replay: String, Sendable, Codable {
         /// Rerunning is harmless (reads, idempotent writes).
         case safe
         /// The default: an interrupted call becomes an `interrupted` error result.
@@ -39,12 +39,12 @@ public struct Tool: Sendable, Identifiable {
     let execute: @Sendable (JSONValue, ToolCallContext) async throws -> ToolResult
 
     /// Bounds on the running output a call keeps, and whether it keeps the head or the tail.
-    public struct OutputLimits: Encodable, Sendable, Hashable {
+    public struct OutputLimits: Codable, Sendable, Hashable {
         public var maxBytes: Int?
         public var maxLines: Int?
         public var retain: Retain?
 
-        public enum Retain: String, Encodable, Sendable {
+        public enum Retain: String, Codable, Sendable {
             case head, tail
         }
 
@@ -261,6 +261,10 @@ public struct ToolCallContext: Sendable {
     /// The durable task running this call. Tasks and conversations it owns are aborted with it.
     public let taskId: TaskID
     public let harness: Harness
+    /// The tail of this call's output the harness keeps and the pace of its progress commits (pi-durable
+    /// `api.outputWindow`), for ``ExecutionEnv/run(_:cwd:environment:inheritEnvironment:timeout:spill:window:onOutput:)``;
+    /// `nil` when the tool keeps the head of its output, which cannot accept skips.
+    public let outputWindow: OutputWindow?
     let handle: ScopeHandle
 
     var engine: Engine { handle.engine }
@@ -273,6 +277,17 @@ public struct ToolCallContext: Sendable {
     /// the result when the tool returns ``ToolResult/streamedOutput``.
     public func output(_ chunk: String) {
         engine.send("tool.output", ["handle": handle.id, "chunk": chunk])
+    }
+
+    /// Appends running output after `skipped` output an environment omitted outside ``outputWindow``, as reported in
+    /// ``ShellOutput/skipped``.
+    public func output(_ chunk: String, skipped: OutputSkip?) {
+        engine.send("tool.output", ["handle": handle.id, "chunk": chunk, "skipped": skipped])
+    }
+
+    /// Appends running output bytes, decoded as UTF-8 across chunks.
+    public func output(_ bytes: Data) {
+        engine.send("tool.output", ["handle": handle.id, "base64": bytes.base64EncodedString()])
     }
 
     /// Replaces the call's running details, an app-facing value shown in ``LiveState/ToolSlot/details``.
@@ -331,6 +346,12 @@ public struct ToolCallContext: Sendable {
     /// The calling conversation's agent.
     public func agent() async throws -> Agent {
         try await handle.call("scope.agent")
+    }
+
+    /// The call's execution environment (pi-durable `api.env`), built by the harness's ``ExecutionEnvironment`` for
+    /// the calling conversation; `nil` without one. Valid until the tool returns.
+    public func environment() async throws -> ExecutionEnv? {
+        try await handle.environment()
     }
 
     /// The tools the calling conversation is offered, with their schemas (pi-durable `api.agent().tools`): the

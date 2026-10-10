@@ -176,7 +176,7 @@ func parked(_ gate: Gate, name: String = "test.parked") -> TaskType<Empty, At, S
         try await withTimeout {
             while try await setup.harness.task(id)?.status != TaskRecord.Status.running { try await Task.sleep(for: .milliseconds(10)) }
         }
-        #expect(try await setup.harness.abortTask(id) == "marked")
+        #expect(try await setup.harness.abortTask(id) == .marked)
         let outcome = try await withTimeout { try await setup.harness.waitForTask(id, as: String.self) }
         guard case .aborted(let reason) = outcome else {
             Issue.record("Expected aborted, got \(outcome)")
@@ -210,7 +210,7 @@ func parked(_ gate: Gate, name: String = "test.parked") -> TaskType<Empty, At, S
         #expect(graph.roots.contains { $0.id == id })
 
         let inspection = try await setup.harness.inspect()
-        #expect(inspection.scheduling == "running")
+        #expect(inspection.scheduling == .running)
         #expect(inspection.tasks.contains { $0.record.id == id })
 
         gate.release()

@@ -227,10 +227,18 @@ actor Engine {
             let json = data.map { String(decoding: $0, as: UTF8.self) } ?? ""
             callbacks?.invokeMethod("hostResolve", withArguments: [id, json])
         case .failure(let error):
-            let info: [String: String] = [
+            var info: [String: String] = [
                 "name": error is CancellationError ? "AbortError" : String(describing: type(of: error)),
                 "message": (error as? LocalizedError)?.errorDescription ?? String(describing: error),
             ]
+            switch error as? PiDurableError {
+            case .file(let code, _, let path)?:
+                info["code"] = code
+                info["path"] = path
+            case .execution(let code, _, _)?:
+                info["code"] = code
+            default: break
+            }
             let json = (try? String(decoding: JSONEncoder().encode(info), as: UTF8.self)) ?? "{}"
             callbacks?.invokeMethod("hostReject", withArguments: [id, json])
         }
@@ -458,6 +466,29 @@ actor Engine {
                     ?? JSValue(undefinedIn: context)
             }, fallback: JSValue(undefinedIn: context))
         } as @convention(block) (String, Double, Double) -> JSValue)
+
+        define("fsOpen", { (path: String, noFollow: Bool) -> Int32 in
+            fileOperation({ try FileOperations.open(path, noFollow: noFollow) }, fallback: -1)
+        } as @convention(block) (String, Bool) -> Int32)
+
+        define("fsReadAt", { (descriptor: Int32, offset: Double, length: Double) -> JSValue in
+            let context = JSContext.current()!
+            return fileOperation({
+                TypedArray.makeUint8Array(
+                    try FileOperations.read(descriptor: descriptor, offset: Int(offset), length: Int(length)), in: context)
+                    ?? JSValue(undefinedIn: context)
+            }, fallback: JSValue(undefinedIn: context))
+        } as @convention(block) (Int32, Double, Double) -> JSValue)
+
+        define("fsFstat", { (descriptor: Int32, name: String) -> String in
+            fileOperation({
+                String(decoding: try JSONEncoder().encode(try FileOperations.info(descriptor: descriptor, name: name)), as: UTF8.self)
+            }, fallback: "{}")
+        } as @convention(block) (Int32, String) -> String)
+
+        define("fsClose", { (descriptor: Int32) in
+            Darwin.close(descriptor)
+        } as @convention(block) (Int32) -> Void)
 
         define("fsWrite", { (path: String, content: JSValue, append: Bool) in
             let data = content.isString ? Data(content.toString().utf8) : (TypedArray.data(of: content) ?? Data())

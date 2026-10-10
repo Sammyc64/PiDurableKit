@@ -24,7 +24,7 @@ public struct Extension: Sendable, Identifiable {
     public var wraps: [Wrap]
     /// Durable task types, resolved by name for every task whatever the conversation selects.
     public var tasks: [AnyTaskType]
-    let builtin: String?
+    let builtin: [BuiltinTool]?
     let javaScript: (source: String, sourceURL: URL?)?
 
     public init(
@@ -54,7 +54,7 @@ public struct Extension: Sendable, Identifiable {
         }
     }
 
-    private init(builtin: String, name: String) {
+    private init(builtin: [BuiltinTool], name: String) {
         self.name = name
         self.tools = []
         self.sections = []
@@ -97,14 +97,27 @@ public struct Extension: Sendable, Identifiable {
         self.javaScript = (source, sourceURL)
     }
 
-    /// pi-durable's `read`, `write`, and `edit` tools, working in the harness's ``ExecutionEnvironment``. (There is no shell on
-    /// iOS, so `bash` is left out.)
-    public static func codingTools(name: String = "coding") -> Extension {
-        Extension(builtin: "coding", name: name)
+    /// pi-durable's `read`, `write`, and `edit` tools, working in the harness's ``ExecutionEnvironment``, and with
+    /// `shell` its `bash` tool too, like pi-durable's `CodingTools`. Commands need an environment with a shell, such as
+    /// ``ExecutionEnvironment/local`` on macOS; there is none on iOS.
+    public static func codingTools(name: String = "coding", shell: Bool = false) -> Extension {
+        Extension(builtin: shell ? [.read, .write, .edit, .bash()] : [.read, .write, .edit], name: name)
+    }
+
+    /// An extension of pi-durable's built-in tools (`@earendil-works/pi-durable/tools`), in order.
+    ///
+    /// ```swift
+    /// let readOnly = Extension.builtinTools(name: "read-only", [.read])
+    /// let shell = Extension.builtinTools(name: "shell", [.bash(commandPrefix: "source .venv/bin/activate")])
+    /// ```
+    public static func builtinTools(name: String, _ tools: [BuiltinTool]) -> Extension {
+        Extension(builtin: tools, name: name)
     }
 
     var specification: BridgeArguments {
-        if let builtin { return ["name": name, "builtin": builtin] }
+        if let builtin {
+            return ["name": name, "builtin": "tools", "builtinTools": builtin.enumerated().map { $1.specification(index: $0) }]
+        }
         if let javaScript {
             return ["name": name, "javaScript": javaScript.source, "sourceURL": javaScript.sourceURL?.absoluteString]
         }
@@ -176,6 +189,12 @@ public struct PromptSection: Sendable {
         ) async throws -> Value {
             try await handle.document(document, of: owner ?? .conversation(conversationId), key: key, asOf: entry)
         }
+
+        /// The environment built for this request (pi-durable `PromptInput.env`), for example to describe the
+        /// working directory; `nil` without one. Valid while the section renders.
+        public func environment() async throws -> ExecutionEnv? {
+            try await handle.environment()
+        }
     }
 
     public let key: String
@@ -234,8 +253,7 @@ public struct HookContext: Sendable {
 
 /// What a compaction is about to summarize, for ``Hook/beforeCompact(_:)``.
 public struct CompactionRequest: Decodable, Sendable {
-    /// `manual`, `threshold`, or `overflow`.
-    public let reason: String
+    public let reason: CompactionReason
     /// The entries the summary replaces, the head marker first.
     public let entries: [Entry]
     /// Their model context, which the summarizer reads.
@@ -260,7 +278,7 @@ public struct Hook: Sendable {
     enum Kind {
         case beforeTool(@Sendable (ToolCall, HookContext) async throws -> ToolDecision)
         case afterTool(@Sendable (ToolCall, ToolResult, HookContext) async throws -> ToolResult?)
-        case onYield(@Sendable (AssistantMessage, HookContext) async throws -> String?)
+        case onYield(@Sendable (AssistantMessage, HookContext) async throws -> [ContentBlock]?)
         case beforeRequest(@Sendable ([Message], HookContext) async throws -> [Message]?)
         case afterResponse(@Sendable (AssistantMessage, HookContext) async throws -> Void)
         case afterTools(@Sendable (EntryID, [EntryID], HookContext) async throws -> Void)
@@ -299,6 +317,14 @@ public struct Hook: Sendable {
 
     /// Runs on each final answer; return a message to continue the run with it as user input, or `nil` to finish.
     public static func onYield(_ handler: @escaping @Sendable (AssistantMessage, HookContext) async throws -> String?) -> Hook {
+        Hook(kind: .onYield { answer, context in try await handler(answer, context).map { [.text($0)] } })
+    }
+
+    /// Runs on each final answer; return user content (text and images) to continue the run with it, or `nil` to
+    /// finish.
+    public static func onYieldContent(
+        _ handler: @escaping @Sendable (AssistantMessage, HookContext) async throws -> [ContentBlock]?
+    ) -> Hook {
         Hook(kind: .onYield(handler))
     }
 
@@ -397,16 +423,47 @@ public struct Wrap: Sendable {
     public typealias SectionNext = @Sendable () async throws -> String?
 
     enum Kind {
-        case tool(String, @Sendable (ToolCall, ToolCallContext, ToolNext) async throws -> ToolResult)
+        case tool(String, ToolWrap)
         case section(String, @Sendable (PromptSection.Input, SectionNext) async throws -> String?)
+    }
+
+    /// What a tool wrap changes.
+    struct ToolWrap {
+        var definition: (@Sendable (inout ToolDefinition) -> Void)?
+        var prepareArguments: (@Sendable (JSONValue) -> JSONValue)?
+        var execute: (@Sendable (ToolCall, ToolCallContext, ToolNext) async throws -> ToolResult)?
     }
 
     let kind: Kind
 
+    /// Wraps the execution of the tool named `name`.
     public static func tool(
         _ name: String, _ wrapper: @escaping @Sendable (ToolCall, ToolCallContext, _ next: ToolNext) async throws -> ToolResult
     ) -> Wrap {
-        Wrap(kind: .tool(name, wrapper))
+        Wrap(kind: .tool(name, ToolWrap(execute: wrapper)))
+    }
+
+    /// Wraps the tool named `name`, as pi-durable's `wrapTool` returns a whole new tool: change what the model sees
+    /// (description, parameters) and how the harness runs it (replay, execution mode, output limits), repair its
+    /// arguments before its own repair step, and wrap its execution.
+    ///
+    /// ```swift
+    /// Wrap.tool("bash", definition: { $0.description += " Prefer pnpm over npm." })
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - name: The tool to wrap.
+    ///   - definition: Changes the tool's definition. Must be pure: it runs whenever the agent is resolved. Changing
+    ///     the name is ignored.
+    ///   - prepareArguments: Repairs arguments before the wrapped tool's own `prepareArguments`. Must be pure.
+    ///   - execute: Wraps execution; `nil` runs the tool unchanged.
+    public static func tool(
+        _ name: String,
+        definition: (@Sendable (inout ToolDefinition) -> Void)? = nil,
+        prepareArguments: (@Sendable (JSONValue) -> JSONValue)? = nil,
+        execute: (@Sendable (ToolCall, ToolCallContext, _ next: ToolNext) async throws -> ToolResult)? = nil
+    ) -> Wrap {
+        Wrap(kind: .tool(name, ToolWrap(definition: definition, prepareArguments: prepareArguments, execute: execute)))
     }
 
     public static func section(
@@ -417,8 +474,80 @@ public struct Wrap: Sendable {
 
     func specification(index: Int) -> BridgeArguments {
         switch kind {
-        case .tool(let name, _): ["index": index, "tool": name]
+        case .tool(let name, let wrap):
+            [
+                "index": index, "tool": name, "defines": wrap.definition != nil, "prepares": wrap.prepareArguments != nil,
+                "executes": wrap.execute != nil,
+            ]
         case .section(let key, _): ["index": index, "section": key]
         }
     }
+}
+
+/// A tool's definition as a ``Wrap`` sees and changes it: the pi-ai `Tool` fields and the harness's run options.
+public struct ToolDefinition: Codable, Sendable, Hashable {
+    /// The tool's name; a wrap cannot change it.
+    public let name: String
+    public var description: String
+    /// The JSON schema of the tool's arguments.
+    public var parameters: JSONValue
+    public var replay: Tool.Replay?
+    public var executionMode: Settings.ToolExecution?
+    public var outputLimits: Tool.OutputLimits?
+}
+
+/// One of pi-durable's built-in tools, for ``Extension/builtinTools(name:_:)``. They work in the call's
+/// ``ExecutionEnvironment`` and fail with an error result without one.
+public enum BuiltinTool: Sendable {
+    /// `read`: reads text files, with offsets and truncation.
+    case read
+    /// `write`: writes files.
+    case write
+    /// `edit`: exact text replacements in a file.
+    case edit
+    /// `bash`: runs a command in the environment's shell, keeping the tail of its output. Needs an environment with a
+    /// shell.
+    ///
+    /// - Parameters:
+    ///   - commandPrefix: Lines run before each command, such as activating a virtual environment.
+    ///   - prepare: Changes each command before it runs: its script, directory, and environment variables.
+    case bash(commandPrefix: String? = nil, prepare: (@Sendable (inout BashExecution, ToolCallContext) async throws -> Void)? = nil)
+    /// `powershell`: runs a command through PowerShell (`pwsh`, then `powershell`, or `programs` in order).
+    case powerShell(
+        commandPrefix: String? = nil, programs: [String]? = nil,
+        prepare: (@Sendable (inout BashExecution, ToolCallContext) async throws -> Void)? = nil)
+
+    var prepare: (@Sendable (inout BashExecution, ToolCallContext) async throws -> Void)? {
+        switch self {
+        case .bash(_, let prepare), .powerShell(_, _, let prepare): prepare
+        default: nil
+        }
+    }
+
+    func specification(index: Int) -> JSONValue {
+        switch self {
+        case .read: return ["kind": "read"]
+        case .write: return ["kind": "write"]
+        case .edit: return ["kind": "edit"]
+        case .bash(let prefix, let prepare):
+            return ["kind": "bash", "index": .number(Double(index)), "commandPrefix": prefix.map(JSONValue.string) ?? .null, "prepares": .bool(prepare != nil)]
+        case .powerShell(let prefix, let programs, let prepare):
+            return [
+                "kind": "powershell", "index": .number(Double(index)), "commandPrefix": prefix.map(JSONValue.string) ?? .null,
+                "programs": programs.map { .array($0.map(JSONValue.string)) } ?? .null, "prepares": .bool(prepare != nil),
+            ]
+        }
+    }
+}
+
+/// A command a built-in shell tool is about to run (pi-durable `BashExecution`).
+public struct BashExecution: Codable, Sendable, Hashable {
+    /// The script, with its prefix.
+    public var command: String
+    /// The working directory.
+    public var cwd: String
+    /// Environment variables.
+    public var env: [String: String]
+    /// Whether the host's environment variables are inherited.
+    public var inheritEnv: Bool
 }

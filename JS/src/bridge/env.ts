@@ -1,11 +1,16 @@
-// A sandboxed execution environment: a virtual file system rooted at one host directory, for pi-durable's
-// read/write/edit tools and JSONL storage. Paths are virtual and absolute (`/notes/todo.md`), so the model never sees
-// the app's container paths and cannot leave the directory. There is no shell on iOS: `exec` fails.
+// Execution environments: a virtual file system and optional shell over a backend, for pi-durable's tools, JSONL
+// storage, and Swift code. Paths are virtual and absolute (`/notes/todo.md`), normalized against `cwd`; `..` never
+// climbs above `/`.
+//
+// Two backends: `NativeBackend`, a sandbox rooted at one host directory (the model never sees the app's container paths
+// and cannot leave the directory; a shell runs there only when Swift enables it, on macOS), and `HostBackend`, an
+// environment implemented in Swift (`CustomExecutionEnvironment`).
 import type { Context } from "@earendil-works/chord";
 import {
 	type BinaryReader,
 	type DirReader,
 	ExecutionError,
+	type ExecutionErrorCode,
 	type ExecutionEnv,
 	err,
 	FileError,
@@ -16,13 +21,59 @@ import {
 	type LineScan,
 	ok,
 	type Result,
+	type ShellExecOptions,
 	type ShellExecResult,
 	type TextLine,
 	type TextLineReader,
+	type WatchChange,
+	type WatchTarget,
 } from "@earendil-works/pi-durable/env";
+import { type Args, host, register } from "./core.ts";
 import { native } from "../runtime/native.ts";
 
-type NativeInfo = { name: string; kind: "file" | "directory" | "symlink"; size: number; mtimeMs: number };
+/** One opened file of a backend. */
+export interface OpenedFile {
+	info(): Promise<NativeInfo>;
+	read(offset: number, length: number): Promise<Uint8Array>;
+	close(): Promise<void>;
+}
+
+export type NativeInfo = { name: string; kind: "file" | "directory" | "symlink"; size: number; mtimeMs: number };
+
+/** One command for a backend's shell: a string for the shell, or an argv array run directly. */
+export type ShellCommand = { command: string | readonly string[]; cwd: string; env?: Record<string, string>; inheritEnv?: boolean; timeout?: number };
+
+/** File and process primitives over virtual, normalized, absolute paths. Failures throw errors with a `code`. */
+export interface EnvBackend {
+	readonly id: string;
+	/** Whether `write` creates missing parent directories itself; otherwise the environment creates them first. */
+	readonly createsParents?: boolean;
+	stat(path: string, follow: boolean): Promise<NativeInfo>;
+	read(path: string): Promise<Uint8Array>;
+	readRange(path: string, offset: number, length: number): Promise<Uint8Array>;
+	write(path: string, content: string | Uint8Array, append: boolean): Promise<void>;
+	truncate(path: string, size: number): Promise<void>;
+	sync(path: string): Promise<void>;
+	rename(source: string, destination: string): Promise<void>;
+	list(path: string): Promise<NativeInfo[]>;
+	mkdir(path: string, recursive: boolean): Promise<void>;
+	remove(path: string, recursive: boolean, force: boolean): Promise<void>;
+	/** The canonical virtual path; throws `permission_denied` when it leaves the file system. */
+	realpath(path: string): Promise<string>;
+	/**
+	 * Opens a regular file whose reads keep seeing it after a rename; absent: the file is read whole when opened.
+	 * Fails with `is_directory` or `invalid` for other kinds.
+	 */
+	open?(path: string, noFollow: boolean): Promise<OpenedFile>;
+	/** Runs a command, delivering output chunks; absent when there is no shell. */
+	exec?(
+		command: ShellCommand,
+		onOutput: (text: string, stream: "stdout" | "stderr") => void,
+		context: Context,
+	): Promise<{ exitCode: number }>;
+	/** Releases the backend's resources. */
+	cleanup?(): Promise<void>;
+}
 
 const encoder = new TextEncoder();
 
@@ -37,56 +88,54 @@ export function normalize(path: string, cwd = "/"): string {
 	return `/${parts.join("/")}`;
 }
 
-/** A FileError for `path`, with host paths under `root` shown as sandbox paths. */
-function fileError(error: unknown, path: string, root: string): FileError {
+function fileError(error: unknown, path: string): FileError {
+	if (error instanceof FileError) return error;
 	const code = ((error as { code?: string }).code ?? "unknown") as FileErrorCode;
-	const message = (error instanceof Error ? error.message : String(error)).replaceAll(root, "");
+	const message = error instanceof Error ? error.message : String(error);
 	return new FileError(code, message, path);
 }
 
-function aborted(context: Context, path: string): Result<never, FileError> | undefined {
-	return context.abortSignal?.aborted ? err(new FileError("aborted", "Operation aborted", path)) : undefined;
+function aborted(context: Context | undefined, path: string): Result<never, FileError> | undefined {
+	return context?.abortSignal?.aborted ? err(new FileError("aborted", "Operation aborted", path)) : undefined;
 }
 
-export class SandboxEnv implements ExecutionEnv {
+let tempCounter = 0;
+
+/** pi-durable's `ExecutionEnv` over a backend. */
+export class BackendEnv implements ExecutionEnv {
 	readonly id: string;
 	cwd: string;
-	readonly #root: string;
-	#temp = 0;
+	readonly backend: EnvBackend;
 
-	/** - Parameter root: the host directory that is `/` in the sandbox. */
-	constructor(root: string, cwd = "/") {
-		this.#root = root.replace(/\/+$/, "");
-		this.id = `sandbox:${this.#root}`;
+	constructor(backend: EnvBackend, cwd = "/") {
+		this.backend = backend;
+		this.id = backend.id;
 		this.cwd = normalize(cwd);
 	}
 
-	#real(path: string): string {
-		return this.#root + normalize(path, this.cwd);
+	#path(path: string): string {
+		return normalize(path, this.cwd);
 	}
 
-	#virtual(real: string): string | undefined {
-		if (real === this.#root) return "/";
-		return real.startsWith(`${this.#root}/`) ? real.slice(this.#root.length) : undefined;
-	}
-
-	#run<T>(path: string, context: Context, body: (real: string) => T): Result<T, FileError> {
+	async #run<T>(path: string, context: Context | undefined, body: (path: string) => Promise<T>): Promise<Result<T, FileError>> {
 		const stop = aborted(context, path);
 		if (stop) return stop;
+		const absolute = this.#path(path);
 		try {
-			return ok(body(this.#real(path)));
+			return ok(await body(absolute));
 		} catch (error) {
-			return err(fileError(error, normalize(path, this.cwd), this.#root));
+			return err(fileError(error, absolute));
 		}
 	}
 
-	#info(path: string, real: string, follow = true): FileInfo {
-		const info = JSON.parse(native.fsStat(real, follow)) as NativeInfo;
-		return { name: normalize(path, this.cwd).split("/").pop() || "/", path: normalize(path, this.cwd), kind: info.kind, size: info.size, mtimeMs: info.mtimeMs };
+	async #info(path: string, follow = true): Promise<FileInfo> {
+		const absolute = this.#path(path);
+		const info = await this.backend.stat(absolute, follow);
+		return { name: absolute.split("/").pop() || "/", path: absolute, kind: info.kind, size: info.size, mtimeMs: info.mtimeMs };
 	}
 
 	async absolutePath(path: string): Promise<Result<string, FileError>> {
-		return ok(normalize(path, this.cwd));
+		return ok(this.#path(path));
 	}
 
 	async joinPath(parts: string[]): Promise<Result<string, FileError>> {
@@ -94,7 +143,7 @@ export class SandboxEnv implements ExecutionEnv {
 	}
 
 	async readTextFile(path: string, context: Context): Promise<Result<string, FileError>> {
-		return this.#run(path, context, (real) => new TextDecoder().decode(native.fsReadFile(real)));
+		return this.#run(path, context, async (absolute) => new TextDecoder().decode(await this.backend.read(absolute)));
 	}
 
 	async readTextLines(path: string, options: { maxLines?: number } | undefined, context: Context): Promise<Result<string[], FileError>> {
@@ -125,24 +174,45 @@ export class SandboxEnv implements ExecutionEnv {
 	}
 
 	async readBinaryFile(path: string, context: Context): Promise<Result<Uint8Array, FileError>> {
-		return this.#run(path, context, (real) => native.fsReadFile(real));
+		return this.#run(path, context, (absolute) => this.backend.read(absolute));
 	}
 
 	async openBinaryReader(path: string, options: { noFollow?: boolean } | undefined, context: Context): Promise<Result<BinaryReader, FileError>> {
-		const opened = this.#run(path, context, (real) => {
-			const info = this.#info(path, real, options?.noFollow !== true);
-			if (info.kind === "directory") throw Object.assign(new Error("Is a directory"), { code: "is_directory" });
-			return real;
+		const noFollow = options?.noFollow === true;
+		const opened = await this.#run(path, context, async (absolute): Promise<OpenedFile> => {
+			if (this.backend.open !== undefined) return this.backend.open(absolute, noFollow);
+			// Without descriptors, the reader keeps the file as it was when opened.
+			const info = await this.backend.stat(absolute, !noFollow);
+			if (info.kind === "directory") throw Object.assign(new Error(`${absolute}: is a directory`), { code: "is_directory" });
+			if (info.kind !== "file") throw Object.assign(new Error(`${absolute}: not a regular file`), { code: "invalid" });
+			const bytes = await this.backend.read(absolute);
+			return {
+				info: async () => ({ ...info, size: bytes.byteLength }),
+				read: async (offset, length) => bytes.slice(offset, offset + length),
+				close: async () => {},
+			};
 		});
 		if (!opened.ok) return opened;
-		const real = opened.value;
-		const absolute = normalize(path, this.cwd);
+		const absolute = this.#path(path);
+		const file = opened.value;
 		let closed = false;
 		const closedError = () => err<never, FileError>(new FileError("invalid", "Binary reader is closed", absolute));
+		const run = <T>(context: Context, body: () => Promise<T>) => this.#run(absolute, context, body);
 		return ok({
-			info: async (context: Context) => (closed ? closedError() : this.#run(path, context, (target) => this.#info(path, target))),
-			read: async (offset: number, length: number, context: Context) =>
-				closed ? closedError() : this.#run(path, context, () => native.fsReadRange(real, offset, length)),
+			info: async (context: Context) =>
+				closed
+					? closedError()
+					: run(context, async () => {
+							const info = await file.info();
+							return { name: absolute.split("/").pop() || "/", path: absolute, kind: info.kind, size: info.size, mtimeMs: info.mtimeMs };
+						}),
+			read: async (offset: number, length: number, context: Context) => {
+				if (closed) return closedError();
+				if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) || offset < 0 || length < 0) {
+					return err(new FileError("invalid", "Invalid byte range", absolute));
+				}
+				return run(context, () => file.read(offset, length));
+			},
 			scanLines: async (options: { startLine: number; endLine?: number }, context: Context): Promise<Result<LineScan, FileError>> => {
 				if (closed) return closedError();
 				let scanner: LineScanner;
@@ -152,7 +222,7 @@ export class SandboxEnv implements ExecutionEnv {
 					return err(new FileError("invalid", "Invalid line range", absolute));
 				}
 				for (let position = 0; ; ) {
-					const chunk = this.#run(path, context, () => native.fsReadRange(real, position, 64 * 1024));
+					const chunk = await run(context, () => file.read(position, 64 * 1024));
 					if (!chunk.ok) return chunk;
 					if (chunk.value.byteLength === 0) return ok(scanner.finish());
 					scanner.push(chunk.value);
@@ -160,39 +230,49 @@ export class SandboxEnv implements ExecutionEnv {
 				}
 			},
 			close: async () => {
+				if (closed) return;
 				closed = true;
+				await file.close();
 			},
 		});
 	}
 
+	/** Writes or appends, creating missing parent directories like pi-durable's Node environment. */
+	async #write(absolute: string, content: string | Uint8Array, append: boolean): Promise<void> {
+		if (this.backend.createsParents !== true) {
+			const parent = absolute.slice(0, absolute.lastIndexOf("/")) || "/";
+			if (parent !== "/") await this.backend.mkdir(parent, true);
+		}
+		await this.backend.write(absolute, content, append);
+	}
+
 	async writeFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-		return this.#run(path, context, (real) => native.fsWrite(real, content, false));
+		return this.#run(path, context, (absolute) => this.#write(absolute, content, false));
 	}
 
 	async appendFile(path: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-		return this.#run(path, context, (real) => native.fsWrite(real, content, true));
+		return this.#run(path, context, (absolute) => this.#write(absolute, content, true));
 	}
 
 	async truncateFile(path: string, size: number, context: Context): Promise<Result<void, FileError>> {
-		return this.#run(path, context, (real) => native.fsTruncate(real, size));
+		return this.#run(path, context, (absolute) => this.backend.truncate(absolute, size));
 	}
 
 	async flushFile(path: string, context: Context): Promise<Result<void, FileError>> {
-		return this.#run(path, context, (real) => native.fsSync(real));
+		return this.#run(path, context, (absolute) => this.backend.sync(absolute));
 	}
 
 	async renameFile(sourcePath: string, destinationPath: string, context: Context): Promise<Result<void, FileError>> {
-		return this.#run(sourcePath, context, (real) => native.fsRename(real, this.#real(destinationPath)));
+		return this.#run(sourcePath, context, (absolute) => this.backend.rename(absolute, this.#path(destinationPath)));
 	}
 
 	async fileInfo(path: string, context: Context): Promise<Result<FileInfo, FileError>> {
-		return this.#run(path, context, (real) => this.#info(path, real, false));
+		return this.#run(path, context, () => this.#info(path, false));
 	}
 
 	async listDir(path: string, context: Context): Promise<Result<FileInfo[], FileError>> {
-		const directory = normalize(path, this.cwd);
-		return this.#run(path, context, (real) =>
-			(JSON.parse(native.fsList(real)) as NativeInfo[]).map((entry) => ({
+		return this.#run(path, context, async (directory) =>
+			(await this.backend.list(directory)).map((entry) => ({
 				name: entry.name,
 				path: normalize(entry.name, directory),
 				kind: entry.kind,
@@ -203,35 +283,123 @@ export class SandboxEnv implements ExecutionEnv {
 	}
 
 	async openDirReader(path: string, context: Context): Promise<Result<DirReader, FileError>> {
-		const listed = await this.listDir(path, context);
+		const listed = await this.#run(path, context, async (directory) => {
+			const info = await this.backend.stat(directory, true);
+			if (info.kind !== "directory") throw Object.assign(new Error(`${directory}: not a directory`), { code: "not_directory" });
+			return { directory, names: (await this.backend.list(directory)).map((entry) => entry.name) };
+		});
 		if (!listed.ok) return listed;
+		const { directory, names } = listed.value;
 		let offset = 0;
+		let closed = false;
 		return ok({
-			next: async (maxEntries: number) => {
-				const entries = listed.value.slice(offset, offset + maxEntries);
-				offset += entries.length;
-				return ok({ entries, done: offset >= listed.value.length });
+			next: async (maxEntries: number, context: Context) => {
+				if (closed) return err(new FileError("invalid", "Directory reader is closed", directory));
+				if (!Number.isSafeInteger(maxEntries) || maxEntries < 1) return err(new FileError("invalid", "maxEntries must be a positive integer", directory));
+				const stopped = aborted(context, directory);
+				if (stopped) return stopped;
+				const entries: FileInfo[] = [];
+				// Entries are described when reached, so one removed meanwhile is skipped.
+				while (offset < names.length && entries.length < maxEntries) {
+					const child = normalize(names[offset++]!, directory);
+					const stop = aborted(context, child);
+					if (stop) return stop;
+					try {
+						const info = await this.backend.stat(child, false);
+						entries.push({ name: names[offset - 1]!, path: child, kind: info.kind, size: info.size, mtimeMs: info.mtimeMs });
+					} catch (error) {
+						if ((error as { code?: string }).code === "not_found") continue;
+						return err(fileError(error, child));
+					}
+				}
+				return ok({ entries, done: offset >= names.length });
 			},
-			close: async () => {},
+			close: async () => {
+				closed = true;
+			},
 		});
 	}
 
-	async watch(): Promise<Result<FileWatcher, FileError>> {
-		return err(new FileError("not_supported", "Watching files is not supported in the sandbox"));
+	/**
+	 * Polls the watched trees about once a second: `polling` mode, since neither backend reports changes itself. A change
+	 * undone between two snapshots can be missed.
+	 */
+	async watch(
+		targets: readonly WatchTarget[],
+		onChange: (change: WatchChange) => void,
+		context: Context,
+	): Promise<Result<FileWatcher, FileError>> {
+		const stop = aborted(context, targets[0]?.path ?? "/");
+		if (stop) return stop;
+		const resolved = targets.map((target) => ({ ...target, path: this.#path(target.path) }));
+		const snapshot = async () => {
+			const files = new Map<string, string>();
+			for (const target of resolved) await this.#snapshot(target, target.path, files, true);
+			return files;
+		};
+		let previous: Map<string, string>;
+		try {
+			previous = await snapshot();
+		} catch (error) {
+			return err(fileError(error, resolved[0]?.path ?? "/"));
+		}
+		let closed = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const poll = async () => {
+			if (closed) return;
+			try {
+				const next = await snapshot();
+				const changed = new Set<string>();
+				for (const [path, stamp] of next) if (previous.get(path) !== stamp) changed.add(path);
+				for (const path of previous.keys()) if (!next.has(path)) changed.add(path);
+				previous = next;
+				if (!closed && changed.size > 0) onChange({ paths: [...changed].sort() });
+			} catch (error) {
+				if (closed) return;
+				closed = true;
+				onChange({ error: fileError(error, resolved[0]?.path ?? "/") });
+				return;
+			}
+			if (!closed) timer = setTimeout(poll, 1000);
+		};
+		timer = setTimeout(poll, 1000);
+		return ok({
+			mode: "polling",
+			close: async () => {
+				closed = true;
+				if (timer !== undefined) clearTimeout(timer);
+			},
+		});
+	}
+
+	async #snapshot(target: WatchTarget, path: string, files: Map<string, string>, top: boolean): Promise<void> {
+		let info: NativeInfo;
+		try {
+			// A watched path that is a symbolic link reports changes to what it points to.
+			info = await this.backend.stat(path, top);
+		} catch (error) {
+			if ((error as { code?: string }).code === "not_found") return;
+			throw error;
+		}
+		files.set(path, `${info.kind}:${info.size}:${info.mtimeMs}`);
+		if (info.kind !== "directory" || (!top && target.recursive !== true)) return;
+		for (const entry of await this.backend.list(path)) {
+			if (target.exclude?.hidden && entry.name.startsWith(".")) continue;
+			if (target.exclude?.names?.includes(entry.name)) continue;
+			const child = normalize(entry.name, path);
+			if (target.recursive === true && entry.kind === "directory") await this.#snapshot(target, child, files, false);
+			else files.set(child, `${entry.kind}:${entry.size}:${entry.mtimeMs}`);
+		}
 	}
 
 	async canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
-		return this.#run(path, context, (real) => {
-			const resolved = this.#virtual(native.fsRealpath(real));
-			if (resolved === undefined) throw Object.assign(new Error("Path resolves outside the sandbox"), { code: "permission_denied" });
-			return resolved;
-		});
+		return this.#run(path, context, (absolute) => this.backend.realpath(absolute));
 	}
 
 	async exists(path: string, context: Context): Promise<Result<boolean, FileError>> {
-		return this.#run(path, context, (real) => {
+		return this.#run(path, context, async (absolute) => {
 			try {
-				native.fsStat(real, false);
+				await this.backend.stat(absolute, false);
 				return true;
 			} catch (error) {
 				if ((error as { code?: string }).code === "not_found") return false;
@@ -241,16 +409,20 @@ export class SandboxEnv implements ExecutionEnv {
 	}
 
 	async createDir(path: string, options: { recursive?: boolean } | undefined, context: Context): Promise<Result<void, FileError>> {
-		return this.#run(path, context, (real) => native.fsMkdir(real, options?.recursive === true));
+		return this.#run(path, context, (absolute) => this.backend.mkdir(absolute, options?.recursive === true));
 	}
 
 	async remove(path: string, options: { recursive?: boolean; force?: boolean } | undefined, context: Context): Promise<Result<void, FileError>> {
-		if (normalize(path, this.cwd) === "/") return err(new FileError("permission_denied", "Cannot remove the sandbox root", "/"));
-		return this.#run(path, context, (real) => native.fsRemove(real, options?.recursive === true, options?.force === true));
+		if (this.#path(path) === "/") return err(new FileError("permission_denied", "Cannot remove the root", "/"));
+		return this.#run(path, context, (absolute) => this.backend.remove(absolute, options?.recursive === true, options?.force === true));
+	}
+
+	#tempName(prefix: string | undefined, suffix = ""): string {
+		return `/.tmp/${prefix ?? "tmp"}${Date.now().toString(36)}${(tempCounter++).toString(36)}${suffix}`;
 	}
 
 	async createTempDir(prefix: string | undefined, context: Context): Promise<Result<string, FileError>> {
-		const path = `/.tmp/${prefix ?? "tmp"}${Date.now().toString(36)}${(this.#temp++).toString(36)}`;
+		const path = this.#tempName(prefix);
 		const created = await this.createDir(path, { recursive: true }, context);
 		return created.ok ? ok(path) : created;
 	}
@@ -258,14 +430,302 @@ export class SandboxEnv implements ExecutionEnv {
 	async createTempFile(options: { prefix?: string; suffix?: string } | undefined, context: Context): Promise<Result<string, FileError>> {
 		const directory = await this.createDir("/.tmp", { recursive: true }, context);
 		if (!directory.ok) return directory;
-		const path = `/.tmp/${options?.prefix ?? "tmp"}${Date.now().toString(36)}${(this.#temp++).toString(36)}${options?.suffix ?? ""}`;
+		const path = this.#tempName(options?.prefix, options?.suffix);
 		const written = await this.writeFile(path, encoder.encode(""), context);
 		return written.ok ? ok(path) : written;
 	}
 
-	async exec(): Promise<Result<ShellExecResult, ExecutionError>> {
-		return err(new ExecutionError("shell_unavailable", "There is no shell in this environment"));
+	async exec(
+		command: string | readonly string[],
+		options: ShellExecOptions | undefined,
+		context: Context,
+	): Promise<Result<ShellExecResult, ExecutionError>> {
+		if (Array.isArray(command) && command.length === 0) return err(new ExecutionError("spawn_error", "Empty argv: no program to run"));
+		const exec = this.backend.exec?.bind(this.backend);
+		if (exec === undefined) return err(new ExecutionError("shell_unavailable", "There is no shell in this environment"));
+		if (options?.timeout !== undefined && (!Number.isFinite(options.timeout) || options.timeout <= 0)) {
+			return err(new ExecutionError("timeout", "Invalid timeout: must be a finite number of seconds"));
+		}
+		if (context.abortSignal?.aborted) return err(new ExecutionError("aborted", "Command aborted"));
+		// The complete output goes to a spill file once it crosses either threshold.
+		const spill = options?.spill;
+		let spillPath: string | undefined;
+		let spillWrites = Promise.resolve();
+		let buffered: string[] = [];
+		let bytes = 0;
+		let lines = 0;
+		const record = (text: string) => {
+			if (spill === undefined) return;
+			if (spillPath !== undefined) {
+				const path = spillPath;
+				spillWrites = spillWrites.then(() => this.backend.write(path, text, true)).catch(() => undefined);
+				return;
+			}
+			buffered.push(text);
+			bytes += encoder.encode(text).byteLength;
+			for (const char of text) if (char === "\n") lines++;
+			if (bytes > spill.afterBytes || lines + 1 > spill.afterLines) {
+				const path = this.#tempName("output-", ".log");
+				spillPath = path;
+				const all = buffered.join("");
+				buffered = [];
+				spillWrites = spillWrites
+					.then(() => this.backend.mkdir("/.tmp", true))
+					.then(() => this.backend.write(path, all, false))
+					.catch(() => undefined);
+			}
+		};
+		let callbackError: unknown;
+		try {
+			const result = await exec(
+				{
+					command,
+					cwd: this.#path(options?.cwd ?? this.cwd),
+					...(options?.env === undefined ? {} : { env: options.env }),
+					...(options?.inheritEnv === undefined ? {} : { inheritEnv: options.inheritEnv }),
+					...(options?.timeout === undefined ? {} : { timeout: options.timeout }),
+				},
+				(text, stream) => {
+					record(text);
+					if (callbackError !== undefined) return;
+					try {
+						options?.onOutput?.(text, context, { stream });
+					} catch (error) {
+						callbackError = error;
+					}
+				},
+				context,
+			);
+			await spillWrites;
+			if (callbackError !== undefined) {
+				return err(new ExecutionError("callback_error", callbackError instanceof Error ? callbackError.message : String(callbackError)));
+			}
+			return ok({ exitCode: result.exitCode, ...(spillPath === undefined ? {} : { spillPath }) });
+		} catch (error) {
+			await spillWrites;
+			const code = (context.abortSignal?.aborted ? "aborted" : ((error as { code?: string }).code ?? "unknown")) as ExecutionErrorCode;
+			const failure = new ExecutionError(code, error instanceof Error ? error.message : String(error));
+			if (spillPath !== undefined) failure.spillPath = spillPath;
+			return err(failure);
+		}
 	}
 
-	async cleanup(): Promise<void> {}
+	async cleanup(): Promise<void> {
+		await this.backend.cleanup?.();
+	}
+}
+
+// MARK: Native sandbox
+
+/** Output chunks of running host commands, by exec ID; Swift pushes them with `env.output`. */
+const outputs = new Map<number, (text: string, stream: "stdout" | "stderr") => void>();
+let nextExec = 1;
+
+/** Runs a command through Swift (a `Process` on macOS), streaming output back through `env.output`. */
+export async function hostExec(
+	method: string,
+	args: Args,
+	command: ShellCommand,
+	onOutput: (text: string, stream: "stdout" | "stderr") => void,
+	context: Context,
+): Promise<{ exitCode: number }> {
+	const exec = nextExec++;
+	outputs.set(exec, onOutput);
+	try {
+		return await host<{ exitCode: number }>(method, { ...args, exec, command }, context);
+	} finally {
+		outputs.delete(exec);
+	}
+}
+
+register({
+	"env.output": (args) => {
+		outputs.get(args.exec)?.(args.text, args.stream);
+	},
+});
+
+/** A sandbox rooted at one host directory, through the runtime's native file functions. */
+export class NativeBackend implements EnvBackend {
+	readonly id: string;
+	readonly createsParents = true;
+	readonly #root: string;
+	readonly #shell: boolean;
+
+	/**
+	 * - Parameter root: the host directory that is `/` in the sandbox.
+	 * - Parameter shell: whether commands run (in the sandbox's real directory), which Swift supports on macOS.
+	 */
+	constructor(root: string, shell = false) {
+		this.#root = root.replace(/\/+$/, "");
+		// The root `/` is the host's own file system, which every such environment shares.
+		this.id = this.#root === "" ? "local" : `sandbox:${this.#root}`;
+		this.#shell = shell;
+		if (!shell) (this as { exec?: unknown }).exec = undefined;
+	}
+
+	#real(path: string): string {
+		return this.#root + path;
+	}
+
+	#virtual(real: string): string | undefined {
+		if (real === this.#root) return "/";
+		return real.startsWith(`${this.#root}/`) ? real.slice(this.#root.length) : undefined;
+	}
+
+	/** Runs a native call; errors show host paths under the root as sandbox paths. */
+	#native<T>(body: () => T): Promise<T> {
+		try {
+			return Promise.resolve(body());
+		} catch (error) {
+			const message = (error instanceof Error ? error.message : String(error)).replaceAll(this.#root, "");
+			return Promise.reject(Object.assign(new Error(message), { code: (error as { code?: string }).code ?? "unknown" }));
+		}
+	}
+
+	stat(path: string, follow: boolean): Promise<NativeInfo> {
+		return this.#native(() => JSON.parse(native.fsStat(this.#real(path), follow)) as NativeInfo);
+	}
+	read(path: string): Promise<Uint8Array> {
+		return this.#native(() => native.fsReadFile(this.#real(path)));
+	}
+	readRange(path: string, offset: number, length: number): Promise<Uint8Array> {
+		return this.#native(() => native.fsReadRange(this.#real(path), offset, length));
+	}
+	write(path: string, content: string | Uint8Array, append: boolean): Promise<void> {
+		return this.#native(() => native.fsWrite(this.#real(path), content, append));
+	}
+	truncate(path: string, size: number): Promise<void> {
+		return this.#native(() => native.fsTruncate(this.#real(path), size));
+	}
+	sync(path: string): Promise<void> {
+		return this.#native(() => native.fsSync(this.#real(path)));
+	}
+	rename(source: string, destination: string): Promise<void> {
+		return this.#native(() => native.fsRename(this.#real(source), this.#real(destination)));
+	}
+	list(path: string): Promise<NativeInfo[]> {
+		return this.#native(() => JSON.parse(native.fsList(this.#real(path))) as NativeInfo[]);
+	}
+	mkdir(path: string, recursive: boolean): Promise<void> {
+		return this.#native(() => native.fsMkdir(this.#real(path), recursive));
+	}
+	remove(path: string, recursive: boolean, force: boolean): Promise<void> {
+		return this.#native(() => native.fsRemove(this.#real(path), recursive, force));
+	}
+	realpath(path: string): Promise<string> {
+		return this.#native(() => {
+			const resolved = this.#virtual(native.fsRealpath(this.#real(path)));
+			if (resolved === undefined) throw Object.assign(new Error("Path resolves outside the sandbox"), { code: "permission_denied" });
+			return resolved;
+		});
+	}
+	open(path: string, noFollow: boolean): Promise<OpenedFile> {
+		return this.#native(() => {
+			const descriptor = native.fsOpen(this.#real(path), noFollow);
+			const name = path.split("/").pop() || "/";
+			let open = true;
+			return {
+				info: () => this.#native(() => JSON.parse(native.fsFstat(descriptor, name)) as NativeInfo),
+				read: (offset: number, length: number) => this.#native(() => native.fsReadAt(descriptor, offset, length)),
+				close: async () => {
+					if (open) native.fsClose(descriptor);
+					open = false;
+				},
+			} satisfies OpenedFile;
+		});
+	}
+	exec(command: ShellCommand, onOutput: (text: string, stream: "stdout" | "stderr") => void, context: Context): Promise<{ exitCode: number }> {
+		if (!this.#shell) return Promise.reject(Object.assign(new Error("There is no shell in this environment"), { code: "shell_unavailable" }));
+		return hostExec("env.shell", { root: this.#root }, { ...command, cwd: this.#real(command.cwd) }, onOutput, context);
+	}
+}
+
+/** The sandbox environment of `root`, with a shell when `shell` is set. */
+export class SandboxEnv extends BackendEnv {
+	constructor(root: string, cwd = "/", shell = false) {
+		super(new NativeBackend(root, shell), cwd);
+	}
+}
+
+// MARK: Environments implemented in Swift
+
+function toBase64(bytes: Uint8Array): string {
+	let binary = "";
+	for (let index = 0; index < bytes.length; index += 0x8000) {
+		binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+	}
+	return btoa(binary);
+}
+
+function fromBase64(text: string): Uint8Array {
+	return Uint8Array.from(atob(text), (char) => char.charCodeAt(0));
+}
+
+export { fromBase64, toBase64 };
+
+/** An environment Swift implements (`CustomExecutionEnvironment`), by its registration number. */
+export class HostBackend implements EnvBackend {
+	readonly id: string;
+	readonly #environment: string;
+	readonly #shell: boolean;
+
+	/** - Parameter environment: the environment's registration key in Swift, its `id`. */
+	constructor(environment: string, id: string, shell: boolean) {
+		this.#environment = environment;
+		this.id = id;
+		this.#shell = shell;
+		if (!shell) (this as { exec?: unknown }).exec = undefined;
+	}
+
+	#call<T>(operation: string, args: Args): Promise<T> {
+		return host<T>("env.custom", { environment: this.#environment, operation, ...args });
+	}
+
+	stat(path: string, follow: boolean): Promise<NativeInfo> {
+		return this.#call("stat", { path, follow });
+	}
+	async read(path: string): Promise<Uint8Array> {
+		return fromBase64(await this.#call<string>("read", { path }));
+	}
+	async readRange(path: string, offset: number, length: number): Promise<Uint8Array> {
+		return fromBase64(await this.#call<string>("readRange", { path, offset, length }));
+	}
+	write(path: string, content: string | Uint8Array, append: boolean): Promise<void> {
+		const bytes = typeof content === "string" ? encoder.encode(content) : content;
+		return this.#call("write", { path, data: toBase64(bytes), append });
+	}
+	truncate(path: string, size: number): Promise<void> {
+		return this.#call("truncate", { path, size });
+	}
+	sync(path: string): Promise<void> {
+		return this.#call("sync", { path });
+	}
+	rename(source: string, destination: string): Promise<void> {
+		return this.#call("rename", { path: source, destination });
+	}
+	list(path: string): Promise<NativeInfo[]> {
+		return this.#call("list", { path });
+	}
+	mkdir(path: string, recursive: boolean): Promise<void> {
+		return this.#call("mkdir", { path, recursive });
+	}
+	remove(path: string, recursive: boolean, force: boolean): Promise<void> {
+		return this.#call("remove", { path, recursive, force });
+	}
+	realpath(path: string): Promise<string> {
+		return this.#call("realpath", { path });
+	}
+	exec(command: ShellCommand, onOutput: (text: string, stream: "stdout" | "stderr") => void, context: Context): Promise<{ exitCode: number }> {
+		if (!this.#shell) return Promise.reject(Object.assign(new Error("There is no shell in this environment"), { code: "shell_unavailable" }));
+		return hostExec("env.custom", { environment: this.#environment, operation: "exec" }, command, onOutput, context);
+	}
+	cleanup(): Promise<void> {
+		return this.#call("cleanup", {});
+	}
+}
+
+/** Builds the environment Swift describes: `{ root, shell }` (a sandbox) or `{ custom, id, shell }` (Swift's own). */
+export function environmentOf(spec: Args, cwd: string | undefined): ExecutionEnv {
+	if (typeof spec.custom === "string") return new BackendEnv(new HostBackend(spec.custom, spec.id, spec.shell === true), cwd ?? spec.cwd ?? "/");
+	return new SandboxEnv(spec.root, cwd ?? "/", spec.shell === true);
 }

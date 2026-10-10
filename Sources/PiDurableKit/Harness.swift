@@ -6,7 +6,9 @@ public struct Storage: Sendable {
         case memory
         case sqlite(URL)
         case jsonl(URL, fsync: Bool)
+        case jsonlEnvironment(any CustomExecutionEnvironment, directory: String, fsync: Bool)
         case database(any SQLiteDatabase)
+        case custom(any CustomStorage)
     }
 
     let kind: Kind
@@ -34,10 +36,30 @@ public struct Storage: Sendable {
         Storage(kind: .database(database))
     }
 
+    /// pi-durable's portable JSONL storage over a file system you implement, such as a synced or encrypted one.
+    ///
+    /// - Parameters:
+    ///   - environment: The file system; only its file operations are used.
+    ///   - directory: The storage directory in it.
+    ///   - fsync: Flush every file before each commit marker.
+    public static func jsonl(in environment: some CustomExecutionEnvironment, directory: String = "/", fsync: Bool = false) -> Storage {
+        Storage(kind: .jsonlEnvironment(environment, directory: directory, fsync: fsync))
+    }
+
+    /// pi-durable's `Storage` interface implemented in Swift.
+    public static func custom(_ storage: some CustomStorage) -> Storage {
+        Storage(kind: .custom(storage))
+    }
+
     func specification(_ router: HostRouter) throws -> BridgeArguments {
         switch kind {
-        case .database(let database): ["kind": "database", "database": router.register(database)]
-        default: try specification
+        case .database(let database): return ["kind": "database", "database": router.register(database)]
+        case .custom(let storage): return ["kind": "custom", "storage": router.register(storage)]
+        case .jsonlEnvironment(let environment, let directory, let fsync):
+            router.register(environment)
+            let spec: JSONValue = ["custom": .string(environment.id), "id": .string(environment.id), "shell": false]
+            return ["kind": "jsonl", "environment": spec, "directory": directory, "fsync": fsync]
+        default: return try specification
         }
     }
 
@@ -45,7 +67,7 @@ public struct Storage: Sendable {
         get throws {
             switch kind {
             case .memory: return ["kind": "memory"]
-            case .database: throw PiDurableError.runtime("A database storage needs a runtime")
+            case .database, .custom, .jsonlEnvironment: throw PiDurableError.runtime("This storage needs a runtime")
             case .sqlite(let url): return ["kind": "sqlite", "path": url.path(percentEncoded: false)]
             case .jsonl(let url, let fsync):
                 try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -55,10 +77,12 @@ public struct Storage: Sendable {
     }
 }
 
-/// Where tools such as ``Extension/codingTools(name:)`` read and write files (pi-durable `HarnessOptions.env`).
+/// Where tools such as ``Extension/codingTools(name:)`` read and write files and run commands (pi-durable
+/// `HarnessOptions.env`).
 public struct ExecutionEnvironment: Sendable {
     enum Kind {
-        case directory(URL)
+        case directory(URL, shell: Bool)
+        case custom(any CustomExecutionEnvironment)
         case perConversation(@Sendable (EnvironmentTarget) async throws -> ExecutionEnvironment?)
     }
 
@@ -67,33 +91,54 @@ public struct ExecutionEnvironment: Sendable {
     /// A sandbox rooted at `directory`: the agent sees it as `/`, a conversation's `cwd` is a path inside it, and
     /// no path can leave it. There is no shell.
     public static func directory(_ directory: URL) -> ExecutionEnvironment {
-        ExecutionEnvironment(kind: .directory(directory))
+        ExecutionEnvironment(kind: .directory(directory, shell: false))
+    }
+
+    #if os(macOS)
+    /// A sandbox rooted at `directory` whose commands run in a shell (`/bin/bash`) in the directory's real location,
+    /// so tools like `bash` work. The sandbox confines file tools only: a command can reach any path the app can, and
+    /// sees host paths, not sandbox paths. macOS only.
+    public static func directory(_ directory: URL, shell: Bool) -> ExecutionEnvironment {
+        ExecutionEnvironment(kind: .directory(directory, shell: shell))
+    }
+
+    /// The Mac's own file system and shell, like pi-durable's `NodeExecutionEnv`: paths are host paths, commands run in
+    /// `/bin/bash`, and nothing is confined. Pair it with a conversation `cwd`. macOS only.
+    public static var local: ExecutionEnvironment {
+        ExecutionEnvironment(kind: .directory(URL(filePath: "/"), shell: true))
+    }
+    #endif
+
+    /// An environment you implement, such as a remote machine or an in-memory file system.
+    public static func custom(_ environment: some CustomExecutionEnvironment) -> ExecutionEnvironment {
+        ExecutionEnvironment(kind: .custom(environment))
     }
 
     /// Chooses each conversation's environment when it is used, like pi-durable's `env` function: for example a
-    /// sandbox per conversation, found through a document. Return `nil` for no environment; return a
-    /// ``directory(_:)``.
+    /// sandbox per conversation, found through a document. Return `nil` for no environment.
     public static func perConversation(
         _ choose: @escaping @Sendable (EnvironmentTarget) async throws -> ExecutionEnvironment?
     ) -> ExecutionEnvironment {
         ExecutionEnvironment(kind: .perConversation(choose))
     }
 
-    /// The sandbox's real root directory.
-    func root() throws -> String {
-        guard case .directory(let url) = kind else {
-            throw PiDurableError.runtime("A per-conversation environment must choose a directory environment")
-        }
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return try FileOperations.realPath(url.path(percentEncoded: false))
-    }
-
-    var specification: BridgeArguments {
-        get throws {
-            switch kind {
-            case .directory: ["root": try root()]
-            case .perConversation: ["perConversation": true]
+    /// The specification JavaScript builds the environment from; registers a custom environment with `router`.
+    func specification(_ router: HostRouter) throws -> JSONValue {
+        switch kind {
+        case .directory(let url, let shell):
+            let root: String
+            if url.path(percentEncoded: false) == "/" {
+                root = "/"
+            } else {
+                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+                root = try FileOperations.realPath(url.path(percentEncoded: false))
             }
+            return ["root": .string(root), "shell": .bool(shell)]
+        case .custom(let environment):
+            router.register(environment)
+            return ["custom": .string(environment.id), "id": .string(environment.id), "shell": .bool(environment.supportsShell)]
+        case .perConversation:
+            return ["perConversation": true]
         }
     }
 }
@@ -184,7 +229,7 @@ public final class Harness: Sendable {
                     "storage": try storage.specification(engine.host),
                     "extensions": extensions.map(\.specification),
                     "settings": settings,
-                    "environment": try environment?.specification,
+                    "environment": try environment?.specification(engine.host),
                     "resume": resume,
                     "conversationCreated": onConversationCreated != nil,
                     "clock": clock != nil,
@@ -231,7 +276,7 @@ public final class Harness: Sendable {
     ) async throws -> Conversation {
         guard let initialize else { return Conversation(harness: self, id: try await create(nil)) }
         let commit = engine.host.registerCommit { [self] tx, extra in
-            let transaction = Transaction(handle: ScopeHandle(engine: engine, id: tx), harness: self)
+            let transaction = Transaction(handle: ScopeHandle(engine: engine, id: tx))
             try await initialize(transaction, ConversationID(extra["conversation"]?.intValue ?? 0))
             return nil
         }
@@ -245,17 +290,32 @@ public final class Harness: Sendable {
         return exists ? Conversation(harness: self, id: id) : nil
     }
 
-    /// Creates a new, ownerless conversation.
+    /// Creates a new conversation.
     ///
     /// - Parameters:
+    ///   - task: The task that owns the new conversation, such as a subagent's call; `nil` (the default) creates an
+    ///     ownerless one. A task-owned conversation starts as a copy of its owner's conversation's agent, and is
+    ///     aborted with its owner.
     ///   - agent: The new conversation's agent.
     ///   - initialize: Runs in the creating commit, for example to seed documents.
     public func createConversation(
-        agent: AgentChange? = nil, initialize: (@Sendable (Transaction, ConversationID) async throws -> Void)? = nil
+        ownedBy task: TaskID? = nil, agent: AgentChange? = nil,
+        initialize: (@Sendable (Transaction, ConversationID) async throws -> Void)? = nil
     ) async throws -> Conversation {
         try await creating(initialize) { initializer in
-            try await self.call("conversation.create", ["agent": agent, "initialize": initializer])
+            try await self.call("conversation.create", ["agent": agent, "initialize": initializer, "ownerTask": task])
         }
+    }
+
+    /// Every conversation's record in ID order (oldest first by default), optionally only those owned by a task or
+    /// created by a conversation's tasks.
+    public func conversations(
+        ownedBy task: TaskID? = nil, ownerConversation: ConversationID? = nil, order: ScanOrder? = nil, limit: Int = 100,
+        after cursor: Cursor? = nil
+    ) async throws -> Page<ConversationRecord> {
+        try await call(
+            "harness.conversations",
+            ["ownerTask": task, "ownerConversation": ownerConversation, "order": order, "limit": limit, "cursor": cursor])
     }
 
     /// Runs `body` in one atomic commit. Everything it writes is stored together, or nothing is.
@@ -267,7 +327,7 @@ public final class Harness: Sendable {
     func commit<T: Sendable>(in conversation: ConversationID?, _ body: @escaping @Sendable (Transaction) async throws -> T)
         async throws -> T
     {
-        try await Transaction.run(harness: self) { commit in
+        try await Transaction.run(engine: engine) { commit in
             try await self.perform("harness.commit", ["commit": commit, "conversation": conversation])
         } body: { transaction, _ in
             (try await body(transaction), nil)
@@ -293,9 +353,24 @@ public final class Harness: Sendable {
         return AgentEventStream(snapshot: snapshot, iterator: iterator)
     }
 
-    /// Reacquires a submission, for example to wait for it after a restart.
-    public func submission(_ id: SubmissionID) -> Submission {
-        Submission(harness: self, id: id)
+    /// Reacquires a submission, for example to wait for it after a restart; `nil` when there is none with this ID.
+    public func submission(_ id: SubmissionID) async throws -> Submission? {
+        let record: SubmissionRecord? = try await call("submission.status", ["submission": id])
+        return record.map { Submission(harness: self, id: $0.id) }
+    }
+
+    /// Withdraws a queued submission, like ``Submission/abort()``. With `conversation`, a submission of another
+    /// conversation is `notFound`.
+    @discardableResult
+    public func abortSubmission(_ id: SubmissionID, in conversation: ConversationID? = nil) async throws -> Submission.AbortResult {
+        try await call("submission.abort", ["submission": id, "conversation": conversation])
+    }
+
+    /// The execution environment the harness builds for a conversation's tool calls, for the app to use directly,
+    /// for example to show the conversation's files or run a command in its directory. `nil` without an environment.
+    public func environment(for conversation: ConversationID) async throws -> ExecutionEnv? {
+        let description: ExecutionEnv.Description? = try await call("harness.env", ["conversation": conversation])
+        return description.map { ExecutionEnv(engine: engine, description: $0, owned: true) }
     }
 
     // MARK: Extensions and settings
@@ -367,9 +442,17 @@ public final class Harness: Sendable {
         return outcome
     }
 
-    /// Aborts one task and the work it owns. Returns `marked`, or `terminal` when it had already ended.
+    /// The outcome of ``abortTask(_:)``.
+    public enum TaskAbortResult: String, Decodable, Sendable {
+        /// The abort mark is committed; the task and the work it owns stop, and its abort handler runs.
+        case marked
+        /// The task had already ended.
+        case terminal
+    }
+
+    /// Aborts one task and the work it owns. A task no installed definition can take settles as orphaned.
     @discardableResult
-    public func abortTask(_ id: TaskID) async throws -> String {
+    public func abortTask(_ id: TaskID) async throws -> TaskAbortResult {
         try await call("harness.abortTask", ["task": id])
     }
 

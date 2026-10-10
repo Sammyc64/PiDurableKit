@@ -27,10 +27,10 @@ public enum ThinkingLevel: String, Codable, Sendable, CaseIterable {
 public struct AgentState: Codable, Sendable, Hashable {
     public var model: ModelRef?
     public var thinkingLevel: ThinkingLevel?
-    /// The raw extension selection: an array of names, or an `{ add, remove }` edit of the default.
-    public var extensions: JSONValue?
-    /// The raw tool filter: an array of names, or `{ remove }`.
-    public var tools: JSONValue?
+    /// The extension selection: exactly some extensions, or an edit of the harness default.
+    public var extensions: AgentChange.Extensions?
+    /// The tool filter: exactly some tools, or all but some.
+    public var tools: AgentChange.Tools?
     public var instructions: String?
     public var cwd: String?
 
@@ -39,14 +39,37 @@ public struct AgentState: Codable, Sendable, Hashable {
 
 /// A conversation's agent, resolved against the installed extensions and the settings.
 public struct Agent: Codable, Sendable, Hashable {
+    /// A system prompt section, by key.
+    public struct Section: Codable, Sendable, Hashable {
+        public var key: String
+        /// Whether the text is wrapped as `<key>\\n…\\n</key>`.
+        public var tag: Bool
+    }
+
     public var model: ModelRef?
     public var thinkingLevel: ThinkingLevel
     /// Selected extensions, in order.
     public var extensions: [String]
     /// The tools a request offers, in order.
     public var tools: [String]
+    /// The system prompt sections, in render order: the extensions' sections, then ``instructions`` when set as the
+    /// section ``PromptSection/instructionsKey``.
+    public var sections: [Section]
     public var instructions: String?
     public var cwd: String?
+
+    private enum CodingKeys: String, CodingKey { case model, thinkingLevel, extensions, tools, sections, instructions, cwd }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decodeIfPresent(ModelRef.self, forKey: .model)
+        thinkingLevel = try container.decodeIfPresent(ThinkingLevel.self, forKey: .thinkingLevel) ?? .off
+        extensions = try container.decodeIfPresent([String].self, forKey: .extensions) ?? []
+        tools = try container.decodeIfPresent([String].self, forKey: .tools) ?? []
+        sections = try container.decodeIfPresent([Section].self, forKey: .sections) ?? []
+        instructions = try container.decodeIfPresent(String.self, forKey: .instructions)
+        cwd = try container.decodeIfPresent(String.self, forKey: .cwd)
+    }
 }
 
 /// A change to a conversation's agent (`configure()`).
@@ -64,7 +87,7 @@ public struct AgentChange: Encodable, Sendable, Hashable {
     }
 
     /// Which extensions a conversation selects.
-    public enum Extensions: Sendable, Hashable {
+    public enum Extensions: Codable, Sendable, Hashable {
         /// Exactly these extensions, in order.
         case only([String])
         /// The harness default, with some added and some removed.
@@ -73,10 +96,33 @@ public struct AgentChange: Encodable, Sendable, Hashable {
         public static func add(_ extensions: Extension...) -> Extensions { .edit(add: extensions.map(\.name)) }
         public static func remove(_ extensions: Extension...) -> Extensions { .edit(remove: extensions.map(\.name)) }
         public static func only(_ extensions: Extension...) -> Extensions { .only(extensions.map(\.name)) }
+
+        public init(from decoder: Decoder) throws {
+            if let names = try? decoder.singleValueContainer().decode([String].self) {
+                self = .only(names)
+                return
+            }
+            let container = try decoder.container(keyedBy: AnyKey.self)
+            self = .edit(
+                add: try container.decodeIfPresent([String].self, forKey: AnyKey("add")) ?? [],
+                remove: try container.decodeIfPresent([String].self, forKey: AnyKey("remove")) ?? [])
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            switch self {
+            case .only(let names):
+                var container = encoder.singleValueContainer()
+                try container.encode(names)
+            case .edit(let add, let remove):
+                var container = encoder.container(keyedBy: AnyKey.self)
+                try container.encode(add, forKey: AnyKey("add"))
+                try container.encode(remove, forKey: AnyKey("remove"))
+            }
+        }
     }
 
     /// Which tools of the selected extensions a conversation offers.
-    public enum Tools: Sendable, Hashable {
+    public enum Tools: Codable, Sendable, Hashable {
         /// Exactly these tools, in order.
         case only([String])
         /// Every tool except these.
@@ -84,6 +130,26 @@ public struct AgentChange: Encodable, Sendable, Hashable {
 
         public static func only(_ tools: Tool...) -> Tools { .only(tools.map(\.name)) }
         public static func remove(_ tools: Tool...) -> Tools { .remove(tools.map(\.name)) }
+
+        public init(from decoder: Decoder) throws {
+            if let names = try? decoder.singleValueContainer().decode([String].self) {
+                self = .only(names)
+                return
+            }
+            let container = try decoder.container(keyedBy: AnyKey.self)
+            self = .remove(try container.decodeIfPresent([String].self, forKey: AnyKey("remove")) ?? [])
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            switch self {
+            case .only(let names):
+                var container = encoder.singleValueContainer()
+                try container.encode(names)
+            case .remove(let names):
+                var container = encoder.container(keyedBy: AnyKey.self)
+                try container.encode(names, forKey: AnyKey("remove"))
+            }
+        }
     }
 
     public var model: ModelRef?
@@ -122,15 +188,7 @@ public struct AgentChange: Encodable, Sendable, Hashable {
         try container.encodeIfPresent(thinkingLevel, forKey: AnyKey("thinkingLevel"))
         try container.encodeIfPresent(instructions, forKey: AnyKey("instructions"))
         try container.encodeIfPresent(cwd, forKey: AnyKey("cwd"))
-        switch extensions {
-        case .only(let names): try container.encode(names, forKey: AnyKey("extensions"))
-        case .edit(let add, let remove): try container.encode(["add": add, "remove": remove], forKey: AnyKey("extensions"))
-        case nil: break
-        }
-        switch tools {
-        case .only(let names): try container.encode(names, forKey: AnyKey("tools"))
-        case .remove(let names): try container.encode(["remove": names], forKey: AnyKey("tools"))
-        case nil: break
-        }
+        try container.encodeIfPresent(extensions, forKey: AnyKey("extensions"))
+        try container.encodeIfPresent(tools, forKey: AnyKey("tools"))
     }
 }
