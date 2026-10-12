@@ -113,6 +113,7 @@ function describeModel(model: Model<string>) {
 		id: model.id,
 		name: model.name,
 		api: model.api,
+		baseUrl: model.baseUrl,
 		reasoning: model.reasoning,
 		input: model.input,
 		contextWindow: model.contextWindow,

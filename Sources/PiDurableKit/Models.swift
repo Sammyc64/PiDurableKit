@@ -204,6 +204,9 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
     public let name: String
     /// The wire protocol, such as `anthropic-messages` or `openai-responses`.
     public let api: String
+    /// Where requests go, such as `https://api.anthropic.com` (a placeholder for providers whose address depends on
+    /// the account, such as `https://{location}-aiplatform.googleapis.com`).
+    public let baseUrl: String?
     public let reasoning: Bool
     /// Accepted inputs: `text`, `image`.
     public let input: [String]
@@ -230,7 +233,7 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
     public var ref: ModelRef { ModelRef(provider: provider, modelId: modelId) }
 
     private enum CodingKeys: String, CodingKey {
-        case provider, id, name, api, reasoning, input, contextWindow, maxTokens, cost, thinkingLevels
+        case provider, id, name, api, baseUrl, reasoning, input, contextWindow, maxTokens, cost, thinkingLevels
     }
 
     public init(from decoder: Decoder) throws {
@@ -239,6 +242,7 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
         modelId = try container.decode(String.self, forKey: .id)
         name = try container.decodeIfPresent(String.self, forKey: .name) ?? modelId
         api = try container.decodeIfPresent(String.self, forKey: .api) ?? ""
+        baseUrl = try container.decodeIfPresent(String.self, forKey: .baseUrl)
         reasoning = try container.decodeIfPresent(Bool.self, forKey: .reasoning) ?? false
         input = try container.decodeIfPresent([String].self, forKey: .input) ?? ["text"]
         contextWindow = Int(try container.decodeIfPresent(Double.self, forKey: .contextWindow) ?? 0)
