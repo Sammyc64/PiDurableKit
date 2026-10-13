@@ -95,6 +95,7 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 | Chord `apply(value, ops)` | `Runtime.applyOperations(_:to:)` |
 | `SqliteStorage` over a `SqliteDatabase` facade | `Storage.sqlite(database:)` with your `SQLiteDatabase` |
 | pi-ai `models.completeSimple()`, `streamSimple()` | `models.complete(_:context:options:)`, `models.stream(_:context:options:)` |
+| a pi-ai provider over Apple's FoundationModels (Swift-only) | `models.register(FoundationModelsProvider())`, `ModelRef.appleOnDevice`, `.applePrivateCloudCompute` |
 | `ROOT_CONVERSATION_ID`, `INSTRUCTIONS_KEY` | `ConversationID.root`, `PromptSection.instructionsKey` |
 | `ReadAfterWrite`, `SessionFailed`, `StorageRequestError`, `ConversationBusy`, `FileError`, `ExecutionError`, `Jsonl*Error` | `PiDurableError.readAfterWrite`, `.sessionFailed(message:cause:)`, `.storageRequestError`, `.conversationBusy(id)`, `.file(code:message:path:)`, `.execution(code:message:spillPath:)`, `.jsonlCorrupted`, `.jsonlPoisoned` |
 | `conversationCreated`, `init`, `now`, `onReport` | `onConversationCreated:`, `initialize:`, `clock:`, `onReport:` |
@@ -494,6 +495,32 @@ Headers work as in pi-ai: a model's `headers` (inheriting its provider's) go wit
 `Settings.Stream.headers` go with every request.
 
 > Shipping provider API keys inside an app exposes them to anyone who inspects it. For production, point a `CustomProvider` (or `Settings.Stream.headers`) at your own backend proxy.
+
+### Apple Foundation Models
+
+Apple's on-device model, Private Cloud Compute, and any other FoundationModels `LanguageModel` work as a provider
+(iOS 27, macOS 27, visionOS 27), with no keys:
+
+```swift
+let models = Models()
+try await models.register(FoundationModelsProvider())          // "apple": on-device and private-cloud-compute
+let harness = try await Harness.open(
+    .sqlite(at: url), models: models, extensions: [assistant],
+    settings: Settings(compaction: .forContextWindow(8192)))     // thresholds for a small window
+let root = try await harness.root(agent: AgentChange(model: .appleOnDevice))   // or .applePrivateCloudCompute
+
+// Pick the models, or bring your own:
+try await models.register(FoundationModelsProvider(models: [
+    .onDevice(SystemLanguageModel(useCase: .contentTagging), id: "tagging"),
+    .init("my-model", model: MyLanguageModel()),
+]))
+```
+
+Requests run in a `LanguageModelSession` built from the conversation's transcript: streaming text and reasoning,
+images on models with vision, usage, and thinking levels on models that reason. Tool calls come back to pi-durable,
+which runs them durably like any provider's; the session never runs a tool itself. A context overflow reads as one, so
+pi-durable compacts and retries. Check availability (`SystemLanguageModel.default.availability`) before offering a model;
+Private Cloud Compute also needs Apple's entitlement in your app.
 
 ### Signing in with a subscription (OAuth)
 

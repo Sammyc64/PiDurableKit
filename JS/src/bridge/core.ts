@@ -130,6 +130,29 @@ export function host<T>(method: string, args: Args, context?: Pick<Context, "abo
 	});
 }
 
+/** Events Swift pushes during a host call, by the call's stream number (`host.event`). */
+const hostStreams = new Map<number, (event: Args) => void>();
+let nextHostStream = 1;
+
+/**
+ * Calls Swift and awaits its answer, receiving the events Swift pushes meanwhile with `HostRouter.events(_:)`; every
+ * event arrives before the answer.
+ */
+export async function hostStream<T>(
+	method: string,
+	args: Args,
+	onEvent: (event: Args) => void,
+	context?: Pick<Context, "abortSignal">,
+): Promise<T> {
+	const stream = nextHostStream++;
+	hostStreams.set(stream, onEvent);
+	try {
+		return await host<T>(method, { ...args, hostStream: stream }, context);
+	} finally {
+		hostStreams.delete(stream);
+	}
+}
+
 /**
  * Calls synchronous Swift code (migrations, task initial states, argument repair, the clock) and returns its answer.
  * The Swift side must not wait for anything.
@@ -163,6 +186,9 @@ export function finish(stream: number, error?: unknown): void {
 }
 
 register({
+	"host.event": (args) => {
+		hostStreams.get(args.hostStream)?.(args.event);
+	},
 	"stream.stop": async (args) => {
 		const stop = streams.get(args.stream);
 		if (stop === undefined) return;

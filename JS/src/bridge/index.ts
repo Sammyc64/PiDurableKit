@@ -2,6 +2,7 @@
 import "../runtime/index.ts";
 import "./core.ts";
 import "./models.ts";
+import "./foundation-models.ts";
 import "./tx.ts";
 import "./scopes.ts";
 import "./extensions.ts";

@@ -1,6 +1,9 @@
 import Foundation
 import os
 
+/// Answers one model request: the request's JSON, and a sink for streamed events; returns the final answer.
+typealias LanguageModelResponder = @Sendable (_ request: JSONValue, _ emit: @escaping @Sendable (JSONValue) -> Void) async throws -> JSONValue
+
 /// Swift code a harness hands to JavaScript besides its extensions.
 struct HarnessCallbacks: Sendable {
     var onConversationCreated: (@Sendable (Transaction, ConversationRecord) async throws -> Void)?
@@ -34,6 +37,7 @@ final class HostRouter: Sendable {
         var environments: [String: any CustomExecutionEnvironment] = [:]
         var storages: [Int: any CustomStorage] = [:]
         var conformanceFactories: [Int: @Sendable () async throws -> JSONValue] = [:]
+        var languageModels: [String: LanguageModelResponder] = [:]
 
         mutating func makeID() -> Int {
             defer { nextID += 1 }
@@ -100,7 +104,13 @@ final class HostRouter: Sendable {
         state.withLock { state in
             state.credentials[models] = nil
             state.responders = state.responders.filter { !$0.key.hasPrefix("\(models)/") }
+            state.languageModels = state.languageModels.filter { !$0.key.hasPrefix("\(models)/") }
         }
+    }
+
+    /// Answers requests to one model of a Swift-implemented provider, such as Foundation Models.
+    func setLanguageModel(models: Int, provider: ProviderID, model: String, _ responder: @escaping LanguageModelResponder) {
+        state.withLock { $0.languageModels["\(models)/\(provider)/\(model)"] = responder }
     }
 
     func registerLogin(_ session: LoginSession) -> Int {
@@ -223,6 +233,7 @@ final class HostRouter: Sendable {
             case "login.prompt": try await loginPrompt(arguments)
             case "login.notify": loginNotify(arguments)
             case "env.custom": try await customEnvironment(arguments)
+            case "foundationModels.respond": try await respondWithLanguageModel(arguments)
             case "env.shell": try await shell(arguments)
             case "storage.custom": try await customStorage(arguments)
             case "conformance.storage", "conformance.environment": try await conformanceSubject(arguments)
@@ -609,6 +620,23 @@ final class HostRouter: Sendable {
         return .bool(checkpointWhen(
             arguments["value"]?.objectValue ?? [:], arguments["ops"]?.arrayValue ?? [],
             arguments["deltasSinceBase"]?.intValue ?? 0))
+    }
+
+    // MARK: Swift language models
+
+    private func respondWithLanguageModel(_ arguments: JSONValue) async throws -> JSONValue {
+        let key = "\(arguments["models"]?.intValue ?? 0)/\(arguments["provider"]?.stringValue ?? "")/\(arguments["model"]?.stringValue ?? "")"
+        guard let responder = state.withLock({ $0.languageModels[key] }) else {
+            throw PiDurableError.notFound("No language model registered for \(key)")
+        }
+        return try await responder(arguments, events(arguments))
+    }
+
+    /// Sends events of a host call to JavaScript's `hostStream`, in order, before the call's answer.
+    func events(_ arguments: JSONValue) -> @Sendable (JSONValue) -> Void {
+        let stream = arguments["hostStream"]?.intValue ?? 0
+        let engine = try? engine
+        return { event in engine?.send("host.event", ["hostStream": stream, "event": event]) }
     }
 
     // MARK: Execution environments
