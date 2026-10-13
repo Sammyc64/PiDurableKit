@@ -175,15 +175,20 @@ struct FoundationModelsResponder: Sendable {
         let sessionId = request["sessionId"]?.stringValue
         let caching = sessionId != nil && request["cacheRetention"]?.stringValue != "none"
         let session: LanguageModelSession
-        if caching, let sessionId, let cached = sessions.take(sessionId: sessionId, tools: toolsKey, keys: keys) {
+        // The first system message is the whole prompt and every tool: the session's leading instructions, even when
+        // pi-durable restated it after the run's first messages (after a compaction or reset). A session without
+        // leading instructions gets its own, declaring every tool, so leaving it in place would declare them twice.
+        let first = history.firstIndex { $0["first"]?.boolValue == true }
+        if caching, let sessionId, let cached = sessions.take(sessionId: sessionId, tools: toolsKey, keys: keys),
+            first.map({ $0 < cached.keys.count }) ?? true
+        {
             session = cached.session
             for message in history.dropFirst(cached.keys.count) {
                 session.transcript.append(contentsOf: try Self.entries(for: message, vision: vision))
             }
         } else {
-            var entries: [Transcript.Entry] = []
-            for message in history { entries += try Self.entries(for: message, vision: vision) }
-            session = LanguageModelSession(model: model, tools: tools, transcript: Transcript(entries: entries))
+            let transcript = Transcript(entries: try Self.transcript(for: history, vision: vision))
+            session = LanguageModelSession(model: model, tools: tools, transcript: transcript)
             session.transcriptErrorHandlingPolicy = .preserveTranscript
         }
 
@@ -537,6 +542,16 @@ struct FoundationModelsResponder: Sendable {
         default:
             return schema
         }
+    }
+
+    /// A new session's transcript: the messages in order, but the first system message (the whole prompt and every
+    /// tool) leading as its instructions.
+    static func transcript(for history: [JSONValue], vision: Bool) throws -> [Transcript.Entry] {
+        var ordered = history
+        if let first = history.firstIndex(where: { $0["first"]?.boolValue == true }) {
+            ordered.insert(ordered.remove(at: first), at: 0)
+        }
+        return try ordered.flatMap { try entries(for: $0, vision: vision) }
     }
 
     static func entries(for json: JSONValue, vision: Bool) throws -> [Transcript.Entry] {

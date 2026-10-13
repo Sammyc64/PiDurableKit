@@ -131,18 +131,21 @@ async function run(
 				// Every tool offered now; the session needs them all to resolve calls.
 				tools: getCurrentTools(messages as never).map(toolDefinition),
 				// System messages stay where they are, as pi-ai sends them to APIs that accept mid-conversation system
-				// messages: the leading one becomes the instructions, later ones instructions entries in place. A
-				// section change then extends the session instead of rewriting its start, which keeps its cache.
+				// messages: later ones become instructions entries in place, so a section change extends the session
+				// instead of rewriting its start, which keeps its cache. The first is the whole prompt (pi-durable
+				// restates it after a compaction or reset, possibly after the run's first messages): Swift makes it the
+				// session's leading instructions.
 				messages: messages.map((message, index) => {
 					if (message.role !== "system") return message;
 					const removed = (message.toolsRemoved ?? []).map((tool) => tool.name);
+					const first = messages.findIndex((other) => other.role === "system") === index;
 					const text = [
-						index === 0 ? getSystemMessageText(message) : renderSystemMessageUpdate(message),
+						first ? getSystemMessageText(message) : renderSystemMessageUpdate(message),
 						...(removed.length === 0 ? [] : [`These tools are no longer available: ${removed.join(", ")}.`]),
 					]
 						.filter((part) => part.length > 0)
 						.join("\n\n");
-					return { role: "system", text, tools: (message.toolsAdded ?? []).map(toolDefinition) };
+					return { role: "system", text, tools: (message.toolsAdded ?? []).map(toolDefinition), ...(first ? { first } : {}) };
 				}),
 				// The conversation's provider session: requests that extend what its Foundation Models session holds
 				// reuse that session and its cache.

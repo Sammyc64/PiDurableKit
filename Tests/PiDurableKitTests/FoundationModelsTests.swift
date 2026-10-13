@@ -352,6 +352,30 @@ struct FoundationModelsTests {
         try await harness.close()
     }
 
+    @Test func restatedPromptLeads() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        // After a compaction, pi-durable restates the prompt after the run's first messages.
+        let lookup: JSONValue = ["name": "lookup", "description": "Look up a fact", "parameters": ["type": "object", "properties": [:]]]
+        let history: [JSONValue] = [
+            ["role": "user", "content": "Summary of the conversation so far", "timestamp": 0],
+            ["role": "system", "text": "Be brief.", "tools": [lookup], "first": true],
+            ["role": "user", "content": "Hi", "timestamp": 0],
+            ["role": "system", "text": "Updated system prompt section \"style\": Be warm.", "tools": []],
+        ]
+        let entries = try FoundationModelsResponder.transcript(for: history, vision: false)
+        guard case .instructions(let instructions) = entries.first else { Issue.record("No leading instructions"); return }
+        #expect(instructions.toolDefinitions.map(\.name) == ["lookup"])
+        #expect(entries.count == 4)
+
+        // A session with leading instructions declares its tools there, once.
+        let session = LanguageModelSession(
+            model: SystemLanguageModel.default, tools: [try FoundationModelsResponder.tool(lookup)], transcript: Transcript(entries: entries))
+        let declared = session.transcript.compactMap { entry -> Int? in
+            if case .instructions(let instructions) = entry { return instructions.toolDefinitions.count } else { return nil }
+        }
+        #expect(declared == [1, 0])
+    }
+
     @Test func schemasDecode() throws {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
         let tool = try FoundationModelsResponder.tool([
