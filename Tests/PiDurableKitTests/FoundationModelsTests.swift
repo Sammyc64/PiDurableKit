@@ -139,6 +139,122 @@ struct FoundationModelsTests {
         try await harness.close()
     }
 
+    @Test func compactsWithinTheSmallWindow() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let (harness, root) = try await setup()
+        // About 4,800 tokens of earlier conversation: past the blocking threshold of an 8,192-token window.
+        for index in 1...16 {
+            let note = (1...20).map { "Fact \(index).\($0): the shop on street \($0 + index) sells \(index * $0) apples." }
+                .joined(separator: " ")
+            _ = try await root.commit { tx in
+                try await tx.append(EntryDraft(kind: "app.note", model: [.user(UserMessage(content: [.text(note)]))]), to: root.id)
+            }
+        }
+        let answer = try await withTimeout(180) { try await ask(root, "Reply with just the word: done") }
+        #expect(answer.text.lowercased().contains("done"))
+        #expect(try await root.view().entries.contains { $0.kind == .compaction })
+        try await harness.close()
+    }
+
+    @Test func abortStopsTheAnswer() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let (harness, root) = try await setup()
+        let submission = try await root.submit("Write a 600 word story about a lighthouse keeper.")
+        try await eventually(20) { try await root.view().streamingMessage != nil }
+        let started = Date()
+        try await withTimeout(10) { try await root.abort() }
+        #expect(Date().timeIntervalSince(started) < 5)
+        let settled = try await submission.wait()
+        guard case .unanswered(_, let reason, _) = settled.status else {
+            Issue.record("Expected an unanswered input, got \(settled.status)")
+            return
+        }
+        #expect(reason == "aborted")
+        try await harness.close()
+    }
+
+    @Test func parallelAndFailingToolCalls() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let calls = Mutex<[String]>([])
+        let weather = Tool(
+            "get_weather", description: "Get the current weather for one city", parameters: .object(["city": .string("The city")])
+        ) { (args: City, _) -> String in
+            calls.update { $0.append(args.city) }
+            if args.city.localizedCaseInsensitiveContains("tokyo") { throw PiDurableError.runtime("Weather service down for Tokyo") }
+            return "It is 31 degrees in \(args.city)."
+        }
+        let (harness, root) = try await setup(extensions: [Extension("weather", tools: [weather])])
+        _ = try await withTimeout(120) {
+            try await ask(root, "Get the weather in Paris and in Tokyo using get_weather, calling it once per city, then summarize.")
+        }
+        #expect(calls.get().count >= 2)
+        let results = try await root.view().entries.compactMap(\.toolResult)
+        #expect(results.contains { $0.isError })
+        #expect(results.contains { !$0.isError && $0.text.contains("31") })
+        #expect(try await root.usage().models["apple/on-device"]?.output ?? 0 > 0)
+        try await harness.close()
+    }
+
+    @Test func steersJoinARunningToolRound() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let gate = Gate()
+        let slow = Tool("lookup", description: "Look up a fact", parameters: .object(["topic": .string("The topic")])) {
+            (_: [String: String], _) -> String in
+            await gate.wait()
+            return "The fact is: 42."
+        }
+        let (harness, root) = try await setup(extensions: [Extension("lookup", tools: [slow])])
+        let submission = try await root.submit("Use the lookup tool to look up the answer, then tell me the number.")
+        try await eventually(30) { try await !root.liveState().tools.isEmpty }
+        _ = try await root.submit("Also, end your answer with the word: banana", whenBusy: .steer)
+        gate.release()
+        let answer = try await withTimeout(120) { try await PiDurableKitTests.answer(of: submission) }
+        let messages = try await root.view().messages.map(\.text)
+        #expect(messages.contains { $0.contains("banana") })
+        _ = answer
+        try await harness.close()
+    }
+
+    @Test func completeWithTools() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let models = Models(builtinProviders: false)
+        try await models.register(FoundationModelsProvider())
+        let message = try await withTimeout(60) {
+            try await models.complete(.appleOnDevice, context: ModelContext(
+                systemPrompt: "Use tools when asked.",
+                messages: [.user(UserMessage(content: [.text("What's the weather in Oslo? Use get_weather.")]))],
+                tools: [ModelTool(name: "get_weather", description: "Get the weather", parameters: .object(["city": .string()]))]))
+        }
+        #expect(message.stopReason == .toolUse)
+        #expect(message.toolCalls.first?.name == "get_weather")
+        let streamed = models.stream(.appleOnDevice, context: ModelContext(messages: [.user(UserMessage(content: [.text("Say hello.")]))]))
+        var events = 0
+        for try await _ in streamed { events += 1 }
+        #expect(events > 1)
+    }
+
+    @Test func errorsReadAsPiAIExpects() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let limited = FoundationModelsResponder.message(for: LanguageModelError.rateLimited(.init(resetDate: nil, debugDescription: "slow down")))
+        #expect(limited.lowercased().contains("rate limit"))
+        let timeout = FoundationModelsResponder.message(for: LanguageModelError.timeout(.init(debugDescription: "late")))
+        #expect(timeout.lowercased().contains("timed out"))
+        let overflow = FoundationModelsResponder.overflow(tokens: 9000, contextSize: 8192)
+        #expect(overflow.contains("exceeds the context window"))
+        // A model without vision gets placeholders instead of images.
+        let segments = FoundationModelsResponder.segments([.image(ImageContent(data: Data([1, 2]), mimeType: "image/png"))], vision: false)
+        guard case .text(let text)? = segments.first else {
+            Issue.record("Expected a placeholder")
+            return
+        }
+        #expect(text.content.contains("image omitted"))
+    }
+
+    @Test func availability() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        #expect(FoundationModelsProvider.Model.onDevice().isAvailable == SystemLanguageModel.default.isAvailable)
+    }
+
     @Test func builtinToolSchemasDecode() async throws {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
         let models = Models(builtinProviders: false)

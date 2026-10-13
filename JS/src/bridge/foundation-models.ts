@@ -52,6 +52,9 @@ export function foundationSchema(schema: unknown): unknown {
 
 /** What Swift answers for one request. */
 type Answer = {
+	/** The response and reasoning as finally written; streamed deltas only append. */
+	text: string;
+	thinking: string;
 	toolCalls: { id: string; name: string; arguments: ToolCall["arguments"] }[];
 	stopReason: AssistantMessage["stopReason"];
 	usage: { input: number; cachedInput: number; output: number; reasoning: number };
@@ -87,6 +90,28 @@ async function run(
 			stream.push({ type: "text_end", contentIndex: text, content: (content[text] as TextContent).text, partial: partial() });
 			text = -1;
 		}
+	};
+	/** Makes a block's text the final one, creating the block when nothing streamed. */
+	const reconcile = (type: "text" | "thinking", final: string) => {
+		let index = type === "text" ? text : thinking;
+		if (index < 0) {
+			if (final === "") return;
+			content.push(type === "text" ? { type, text: "" } : { type, thinking: "" });
+			index = content.length - 1;
+			if (type === "text") text = index;
+			else thinking = index;
+			stream.push({ type: type === "text" ? "text_start" : "thinking_start", contentIndex: index, partial: partial() });
+		}
+		const block = content[index] as unknown as { text: string; thinking: string };
+		const current = type === "text" ? block.text : block.thinking;
+		if (current === final) return;
+		if (final.startsWith(current)) {
+			const delta = final.slice(current.length);
+			if (type === "text") block.text = final;
+			else block.thinking = final;
+			stream.push({ type: type === "text" ? "text_delta" : "thinking_delta", contentIndex: index, delta, partial: partial() });
+		} else if (type === "text") block.text = final;
+		else block.thinking = final;
 	};
 	stream.push({ type: "start", partial: partial() });
 	try {
@@ -133,6 +158,10 @@ async function run(
 			},
 			signal === undefined ? undefined : { abortSignal: signal },
 		);
+		if (signal?.aborted) throw new Error("Request was aborted");
+		// The final text replaces what streamed, in case the model revised it mid-stream.
+		reconcile("thinking", answer.thinking);
+		reconcile("text", answer.text);
 		close();
 		for (const call of answer.toolCalls) {
 			const block: ToolCall = { type: "toolCall", id: call.id, name: call.name, arguments: call.arguments };

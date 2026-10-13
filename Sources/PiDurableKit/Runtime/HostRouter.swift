@@ -108,6 +108,13 @@ final class HostRouter: Sendable {
         }
     }
 
+    /// Forgets the models of a provider, before it is registered again.
+    func removeLanguageModels(models: Int, provider: ProviderID) {
+        state.withLock { state in
+            state.languageModels = state.languageModels.filter { !$0.key.hasPrefix("\(models)/\(provider)/") }
+        }
+    }
+
     /// Answers requests to one model of a Swift-implemented provider, such as Foundation Models.
     func setLanguageModel(models: Int, provider: ProviderID, model: String, _ responder: @escaping LanguageModelResponder) {
         state.withLock { $0.languageModels["\(models)/\(provider)/\(model)"] = responder }

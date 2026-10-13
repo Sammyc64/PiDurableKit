@@ -128,9 +128,10 @@ public struct Settings: Codable, Sendable, Hashable {
 
         /// Thresholds in proportion to a small context window, such as the on-device model's: pi-durable's defaults
         /// (16,384 tokens reserved, 20,000 kept) suit large windows and would never compact a window of a few thousand
-        /// tokens before it overflows.
+        /// tokens before it overflows. Half the window stays free, so the request that summarizes older entries fits
+        /// the same window, and a quarter is kept verbatim.
         public static func forContextWindow(_ tokens: Int) -> Compaction {
-            Compaction(reserveTokens: tokens / 4, keepRecentTokens: tokens / 4, backgroundTokens: tokens / 8)
+            Compaction(reserveTokens: tokens / 2, keepRecentTokens: tokens / 4, backgroundTokens: tokens / 8)
         }
     }
 

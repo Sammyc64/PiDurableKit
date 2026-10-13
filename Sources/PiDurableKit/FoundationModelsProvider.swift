@@ -17,8 +17,8 @@ import ImageIO
 /// Requests run in a `LanguageModelSession` over the conversation's transcript. Tool calls return to pi-durable, which
 /// runs them durably like any other provider's; the session never runs a tool itself. Tools whose parameters Foundation
 /// Models cannot express, such as untyped properties, are not offered to these models. No credentials are needed; check
-/// a model's availability (`SystemLanguageModel.default.availability`) before offering it. Small context windows want
-/// smaller compaction thresholds: see ``Settings/Compaction/forContextWindow(_:)``.
+/// ``Model/isAvailable`` before offering a model. The on-device window (8,192 tokens) is too small for pi-durable's
+/// default compaction: open the harness with ``Settings/Compaction/forContextWindow(_:)``.
 @available(iOS 27.0, macOS 27.0, visionOS 27.0, *)
 public struct FoundationModelsProvider: Sendable {
     /// One model of the provider: a `LanguageModel` under an ID.
@@ -50,6 +50,14 @@ public struct FoundationModelsProvider: Sendable {
         /// Apple's larger model on Private Cloud Compute.
         public static var privateCloudCompute: Model {
             Model(ModelRef.applePrivateCloudCompute.modelId, name: "Private Cloud Compute", model: PrivateCloudComputeLanguageModel())
+        }
+
+        /// Whether the model can answer now: Apple Intelligence is enabled and the model downloaded, or Private Cloud
+        /// Compute is reachable. Other models are assumed available.
+        public var isAvailable: Bool {
+            if let system = model as? SystemLanguageModel { return system.isAvailable }
+            if let cloud = model as? PrivateCloudComputeLanguageModel { return cloud.isAvailable }
+            return true
         }
 
         /// The model's context window, as reported.
@@ -97,6 +105,7 @@ extension Models {
     /// Registers Apple Foundation Models (or replaces a provider with the same ID).
     public func register(_ provider: FoundationModelsProvider) async throws {
         try await prepare()
+        runtime.engine.host.removeLanguageModels(models: id, provider: provider.id)
         var specifications: [JSONValue] = []
         for model in provider.models {
             let capabilities = model.model.capabilities
@@ -141,10 +150,14 @@ struct FoundationModelsResponder: Sendable {
     }
 
     func respond(to request: JSONValue, emit: @escaping @Sendable (JSONValue) -> Void) async throws -> JSONValue {
+        if let unavailable = availabilityError(model) {
+            return Self.answer(stopReason: "error", usage: nil, error: unavailable)
+        }
         let messages = try (request["messages"] ?? []).decode(as: [Message].self)
         // A tool whose schema Foundation Models cannot express, such as one with untyped properties, is not offered.
         let tools = (request["tools"]?.arrayValue ?? []).compactMap { try? Self.tool($0) }
         let options = request["options"] ?? [:]
+        let vision = model.capabilities.contains(.vision)
 
         // The trailing user message is the prompt; after tool results, the session continues from an empty one.
         var history = messages
@@ -160,25 +173,23 @@ struct FoundationModelsResponder: Sendable {
                 segments: instructions.isEmpty ? [] : [.text(.init(content: instructions))],
                 toolDefinitions: tools.map(Transcript.ToolDefinition.init(tool:)))))
         }
-        for message in history { entries += try Self.entries(for: message) }
+        for message in history { entries += try Self.entries(for: message, vision: vision) }
         // The on-device model counts tokens locally: an overflow is reported before the request, in the same words on
         // every platform, so pi-durable compacts and retries.
         if let system = model as? SystemLanguageModel {
-            let counted = entries + [.prompt(Transcript.Prompt(segments: try Self.segments(prompt?.content ?? [])))]
+            let counted = entries + [.prompt(Transcript.Prompt(segments: Self.segments(prompt?.content ?? [], vision: vision)))]
             if let tokens = try? await system.tokenCount(for: counted), tokens > system.contextSize {
-                return Self.answer(
-                    stopReason: "error", usage: LanguageModelSession.Usage(input: .init(totalTokenCount: 0, cachedTokenCount: 0), output: .init(totalTokenCount: 0, reasoningTokenCount: 0)),
-                    error: "Input of \(tokens) tokens exceeds the context window of \(system.contextSize) tokens")
+                return Self.answer(stopReason: "error", usage: nil, error: Self.overflow(tokens: tokens, contextSize: system.contextSize))
             }
         }
         let session = LanguageModelSession(model: model, tools: tools, transcript: Transcript(entries: entries))
         session.transcriptErrorHandlingPolicy = .preserveTranscript
         let start = session.transcript.count
 
-        var generation = GenerationOptions(
-            samplingMode: nil, temperature: options["temperature"]?.doubleValue,
-            maximumResponseTokens: options["maxTokens"]?.intValue, toolCallingMode: Self.toolCallingMode(options["toolChoice"]))
-        if tools.isEmpty { generation.toolCallingMode = nil }
+        let maxTokens = options["maxTokens"]?.intValue
+        let generation = GenerationOptions(
+            samplingMode: nil, temperature: options["temperature"]?.doubleValue, maximumResponseTokens: maxTokens,
+            toolCallingMode: tools.isEmpty ? nil : Self.toolCallingMode(options["toolChoice"]))
         let context = ContextOptions(
             reasoningLevel: model.capabilities.contains(.reasoning) ? Self.reasoningLevel(options["reasoning"]?.stringValue) : nil)
 
@@ -187,26 +198,29 @@ struct FoundationModelsResponder: Sendable {
         var usage: LanguageModelSession.Usage?
         do {
             let stream = session.streamResponse(
-                to: try Self.prompt(prompt), options: generation, contextOptions: context, metadata: [:])
+                to: Self.prompt(prompt, vision: vision), options: generation, contextOptions: context, metadata: [:])
             for try await snapshot in stream {
+                // A Foundation Models stream runs on when its task is cancelled; stop it here.
+                try Task.checkCancellation()
                 usage = snapshot.usage
-                let reasoning = snapshot.transcriptEntries.compactMap { entry -> String? in
-                    if case .reasoning(let reasoning) = entry { return Self.text(of: reasoning.segments) }
-                    return nil
-                }.joined(separator: "\n")
+                let reasoning = Self.reasoning(in: snapshot.transcriptEntries)
                 if reasoning.count > thinking.count, reasoning.hasPrefix(thinking) {
                     emit(["type": "thinking", "delta": .string(String(reasoning.dropFirst(thinking.count)))])
-                    thinking = reasoning
                 }
+                thinking = reasoning
                 let content = snapshot.content
                 if content.count > text.count, content.hasPrefix(text) {
                     emit(["type": "text", "delta": .string(String(content.dropFirst(text.count)))])
-                    text = content
                 }
+                text = content
             }
-            return Self.answer(stopReason: "stop", usage: usage ?? session.usage)
+            try Task.checkCancellation()
+            let final = usage ?? session.usage
+            let truncated = maxTokens.map { final.output.totalTokenCount >= $0 } ?? false
+            return Self.answer(stopReason: truncated ? "length" : "stop", usage: final, text: text, thinking: thinking)
         } catch let error as LanguageModelSession.ToolCallError where error.underlyingError is ToolCallsRequested {
-            let calls = session.transcript.dropFirst(start).compactMap { entry -> Transcript.ToolCalls? in
+            let added = session.transcript.dropFirst(start)
+            let calls = added.compactMap { entry -> Transcript.ToolCalls? in
                 if case .toolCalls(let calls) = entry { return calls }
                 return nil
             }.last
@@ -216,40 +230,110 @@ struct FoundationModelsResponder: Sendable {
                     "arguments": try JSONValue(json: call.arguments.jsonString),
                 ]
             }
-            return Self.answer(stopReason: "toolUse", usage: session.usage, toolCalls: toolCalls)
-        } catch is CancellationError {
-            throw CancellationError()
+            // Text the model wrote before its calls, as the transcript recorded it.
+            let written = added.compactMap { entry -> String? in
+                if case .response(let response) = entry { return Self.text(of: response.segments) }
+                return nil
+            }.joined()
+            return Self.answer(
+                stopReason: "toolUse", usage: session.usage, toolCalls: toolCalls, text: written.isEmpty ? text : written,
+                thinking: Self.reasoning(in: added))
         } catch {
-            return Self.answer(stopReason: "error", usage: usage ?? session.usage, error: Self.message(for: error))
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            return Self.answer(stopReason: "error", usage: usage ?? session.usage, error: Self.message(for: error), text: text)
         }
     }
 
+    /// Why a model cannot answer now, in words pi-ai retries when waiting helps (a model still downloading).
+    func availabilityError(_ model: any LanguageModel) -> String? {
+        if let system = model as? SystemLanguageModel, case .unavailable(let reason) = system.availability {
+            switch reason {
+            case .modelNotReady: return "Apple's on-device model is not ready yet (service unavailable while it downloads)"
+            case .appleIntelligenceNotEnabled: return "Apple's on-device model is unavailable: Apple Intelligence is not enabled"
+            case .deviceNotEligible: return "Apple's on-device model is unavailable: this device is not eligible"
+            @unknown default: return "Apple's on-device model is unavailable: \(reason)"
+            }
+        }
+        if let cloud = model as? PrivateCloudComputeLanguageModel, case .unavailable(let reason) = cloud.availability {
+            switch reason {
+            case .systemNotReady: return "Private Cloud Compute is not ready yet (service unavailable)"
+            case .deviceNotEligible: return "Private Cloud Compute is unavailable: this device is not eligible"
+            @unknown default: return "Private Cloud Compute is unavailable: \(reason)"
+            }
+        }
+        return nil
+    }
+
     static func answer(
-        stopReason: String, usage: LanguageModelSession.Usage, toolCalls: [JSONValue] = [], error: String? = nil
+        stopReason: String, usage: LanguageModelSession.Usage?, toolCalls: [JSONValue] = [], error: String? = nil,
+        text: String = "", thinking: String = ""
     ) -> JSONValue {
         var answer: JSONObject = [
             "stopReason": .string(stopReason),
             "toolCalls": .array(toolCalls),
+            "text": .string(text),
+            "thinking": .string(thinking),
             "usage": [
-                "input": .number(Double(usage.input.totalTokenCount)),
-                "cachedInput": .number(Double(usage.input.cachedTokenCount)),
-                "output": .number(Double(usage.output.totalTokenCount)),
-                "reasoning": .number(Double(usage.output.reasoningTokenCount)),
+                "input": .number(Double(usage?.input.totalTokenCount ?? 0)),
+                "cachedInput": .number(Double(usage?.input.cachedTokenCount ?? 0)),
+                "output": .number(Double(usage?.output.totalTokenCount ?? 0)),
+                "reasoning": .number(Double(usage?.output.reasoningTokenCount ?? 0)),
             ],
         ]
         if let error { answer["errorMessage"] = .string(error) }
         return .object(answer)
     }
 
-    /// Error text pi-ai classifies: a context overflow in the words it recognizes, so pi-durable compacts and retries.
+    static func reasoning(in entries: some Sequence<Transcript.Entry>) -> String {
+        entries.compactMap { entry -> String? in
+            if case .reasoning(let reasoning) = entry { return text(of: reasoning.segments) }
+            return nil
+        }.joined(separator: "\n")
+    }
+
+    /// Error text in the words pi-ai classifies: a context overflow as one, so pi-durable compacts and retries, and
+    /// transient failures (rate limits, timeouts, network, a busy service) as retryable; refusals and guardrail
+    /// violations are not retried.
     static func message(for error: Error) -> String {
-        if case .contextSizeExceeded(let exceeded)? = error as? LanguageModelError {
-            return "Input of \(exceeded.tokenCount) tokens exceeds the context window of \(exceeded.contextSize) tokens"
+        let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        if let error = error as? LanguageModelError {
+            switch error {
+            case .contextSizeExceeded(let exceeded):
+                return overflow(tokens: exceeded.tokenCount, contextSize: exceeded.contextSize)
+            case .rateLimited: return "Rate limit reached: \(detail)"
+            case .timeout: return "Request timed out: \(detail)"
+            case .guardrailViolation: return "Guardrail violation: \(detail)"
+            case .refusal: return "The model refused: \(detail)"
+            default: return detail
+            }
         }
-        if case .exceededContextWindowSize? = error as? LanguageModelSession.GenerationError {
-            return "The input exceeds the context window. \(error.localizedDescription)"
+        if let error = error as? LanguageModelSession.GenerationError {
+            switch error {
+            case .exceededContextWindowSize: return "The input exceeds the context window: \(detail)"
+            case .rateLimited: return "Rate limit reached: \(detail)"
+            case .assetsUnavailable: return "The model's assets are unavailable (service unavailable): \(detail)"
+            case .concurrentRequests: return "The model is busy with other requests (service unavailable): \(detail)"
+            default: return detail
+            }
         }
-        return (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        if let error = error as? PrivateCloudComputeLanguageModel.Error {
+            switch error {
+            case .networkFailure: return "Network error reaching Private Cloud Compute: \(detail)"
+            case .serviceUnavailable: return "Private Cloud Compute: service unavailable: \(detail)"
+            case .quotaLimitReached: return "Private Cloud Compute quota limit reached: \(detail)"
+            @unknown default: return detail
+            }
+        }
+        if case .assetsUnavailable? = error as? SystemLanguageModel.Error {
+            return "Apple's on-device model assets are unavailable (service unavailable): \(detail)"
+        }
+        return detail
+    }
+
+    /// A context overflow in pi-ai's words, with what lets pi-durable compact a window this small.
+    static func overflow(tokens: Int, contextSize: Int) -> String {
+        "Input of \(tokens) tokens exceeds the context window of \(contextSize) tokens. To compact conversations this "
+            + "small, open the harness with Settings(compaction: .forContextWindow(\(contextSize)))."
     }
 
     static func toolCallingMode(_ choice: JSONValue?) -> GenerationOptions.ToolCallingMode? {
@@ -313,10 +397,10 @@ struct FoundationModelsResponder: Sendable {
         }
     }
 
-    static func entries(for message: Message) throws -> [Transcript.Entry] {
+    static func entries(for message: Message, vision: Bool) throws -> [Transcript.Entry] {
         switch message {
         case .user(let user):
-            return [.prompt(Transcript.Prompt(segments: try segments(user.content)))]
+            return [.prompt(Transcript.Prompt(segments: segments(user.content, vision: vision)))]
         case .assistant(let assistant):
             // Failed and aborted attempts without content add nothing; thinking is not replayed.
             var entries: [Transcript.Entry] = []
@@ -329,18 +413,24 @@ struct FoundationModelsResponder: Sendable {
             if !calls.isEmpty { entries.append(.toolCalls(Transcript.ToolCalls(calls))) }
             return entries
         case .toolResult(let result):
-            return [.toolOutput(Transcript.ToolOutput(id: result.toolCallId, toolName: result.toolName, segments: try segments(result.content)))]
+            var segments = segments(result.content, vision: vision)
+            // The model sees that a call failed, as providers with an error flag would tell it.
+            if result.isError { segments.insert(.text(.init(content: "Error:")), at: 0) }
+            return [.toolOutput(Transcript.ToolOutput(id: result.toolCallId, toolName: result.toolName, segments: segments))]
         default:
             return []
         }
     }
 
-    static func segments(_ content: [ContentBlock]) throws -> [Transcript.Segment] {
+    /// Text and images; a model without vision gets a placeholder for each image.
+    static func segments(_ content: [ContentBlock], vision: Bool) -> [Transcript.Segment] {
         content.compactMap { block in
             switch block {
             case .text(let text): return .text(.init(content: text))
             case .image(let image):
-                guard let cgImage = cgImage(image) else { return .text(.init(content: "[image: \(image.mimeType)]")) }
+                guard vision, let cgImage = cgImage(image) else {
+                    return .text(.init(content: "[image omitted: \(image.mimeType); this model does not take images]"))
+                }
                 return .attachment(.init(content: .image(.init(cgImage))))
             default: return nil
             }
@@ -361,12 +451,16 @@ struct FoundationModelsResponder: Sendable {
         }
     }
 
-    static func prompt(_ message: UserMessage?) throws -> Prompt {
+    static func prompt(_ message: UserMessage?, vision: Bool) -> Prompt {
         guard let message else { return Prompt("") }
         let parts = message.content.compactMap { block -> PromptPart? in
             switch block {
             case .text(let text): return PromptPart(text: text, image: nil)
-            case .image(let image): return cgImage(image).map { PromptPart(text: "", image: $0) }
+            case .image(let image):
+                guard vision, let cgImage = cgImage(image) else {
+                    return PromptPart(text: "[image omitted: \(image.mimeType); this model does not take images]", image: nil)
+                }
+                return PromptPart(text: "", image: cgImage)
             default: return nil
             }
         }

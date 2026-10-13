@@ -506,7 +506,7 @@ let models = Models()
 try await models.register(FoundationModelsProvider())          // "apple": on-device and private-cloud-compute
 let harness = try await Harness.open(
     .sqlite(at: url), models: models, extensions: [assistant],
-    settings: Settings(compaction: .forContextWindow(8192)))     // thresholds for a small window
+    settings: Settings(compaction: .forContextWindow(8192)))     // compaction sized for the on-device window
 let root = try await harness.root(agent: AgentChange(model: .appleOnDevice))   // or .applePrivateCloudCompute
 
 // Pick the models, or bring your own:
@@ -516,11 +516,21 @@ try await models.register(FoundationModelsProvider(models: [
 ]))
 ```
 
-Requests run in a `LanguageModelSession` built from the conversation's transcript: streaming text and reasoning,
-images on models with vision, usage, and thinking levels on models that reason. Tool calls come back to pi-durable,
-which runs them durably like any provider's; the session never runs a tool itself. A context overflow reads as one, so
-pi-durable compacts and retries. Check availability (`SystemLanguageModel.default.availability`) before offering a model;
-Private Cloud Compute also needs Apple's entitlement in your app.
+Everything else works as with any provider: tools (parallel calls included) run durably in pi-durable, never in the
+session; nested calls, code mode, hooks, steering, follow-ups, aborts, compaction, and restarts behave the same. Answers
+and reasoning stream; images reach models with vision (others get a placeholder); usage lands in `pi.usage` at no cost;
+thinking levels apply to models that reason (Private Cloud Compute).
+
+- **Compaction.** The on-device window is 8,192 tokens (Private Cloud Compute's 32,768). pi-durable's default compaction
+  keeps 20,000 tokens and could never compact such a window, so open the harness with
+  `Settings(compaction: .forContextWindow(…))`, sized for the smallest window your conversations use. An overflow says
+  so in its error.
+- **Availability.** `FoundationModelsProvider.Model.isAvailable` (or `SystemLanguageModel.default.availability`) tells
+  whether Apple Intelligence is on and the model downloaded; offer the model only then. A model still downloading, a
+  rate limit, or an unreachable Private Cloud Compute fails with an error pi-durable retries; guardrail violations and
+  refusals are not retried.
+- **Limits.** Tools whose parameters Foundation Models cannot express (untyped properties) are not offered to these
+  models. Prompt caching and deferred requests don't apply. Private Cloud Compute needs Apple's entitlement in your app.
 
 ### Signing in with a subscription (OAuth)
 

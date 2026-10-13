@@ -104,6 +104,9 @@ function aborted(context: Context | undefined, path: string): Result<never, File
 
 let tempCounter = 0;
 
+/** How often a watch compares snapshots; changes must be reported within a few seconds even on a busy device. */
+const POLL_INTERVAL_MS = 500;
+
 /** pi-durable's `ExecutionEnv` over a backend. */
 export class BackendEnv implements ExecutionEnv {
 	readonly id: string;
@@ -324,7 +327,7 @@ export class BackendEnv implements ExecutionEnv {
 	}
 
 	/**
-	 * Polls the watched trees about once a second: `polling` mode, since neither backend reports changes itself. A change
+	 * Polls the watched trees twice a second: `polling` mode, since neither backend reports changes itself. A change
 	 * undone between two snapshots can be missed.
 	 */
 	async watch(
@@ -353,8 +356,19 @@ export class BackendEnv implements ExecutionEnv {
 			try {
 				const next = await snapshot();
 				const changed = new Set<string>();
-				for (const [path, stamp] of next) if (previous.get(path) !== stamp) changed.add(path);
-				for (const path of previous.keys()) if (!next.has(path)) changed.add(path);
+				const watched = (path: string) => resolved.some((target) => path === target.path || path.startsWith(`${target.path}/`));
+				// An entry that appears or disappears changes its directory's listing too, which a directory replaced
+				// between two snapshots may not show by itself.
+				const appearedOrVanished = (path: string) => {
+					changed.add(path);
+					const parent = parentOf(path);
+					if (watched(parent)) changed.add(parent);
+				};
+				for (const [path, stamp] of next) {
+					if (!previous.has(path)) appearedOrVanished(path);
+					else if (previous.get(path) !== stamp) changed.add(path);
+				}
+				for (const path of previous.keys()) if (!next.has(path)) appearedOrVanished(path);
 				previous = next;
 				if (!closed && changed.size > 0) onChange({ paths: [...changed].sort() });
 			} catch (error) {
@@ -363,9 +377,9 @@ export class BackendEnv implements ExecutionEnv {
 				onChange({ error: fileError(error, resolved[0]?.path ?? "/") });
 				return;
 			}
-			if (!closed) timer = setTimeout(poll, 1000);
+			if (!closed) timer = setTimeout(poll, POLL_INTERVAL_MS);
 		};
-		timer = setTimeout(poll, 1000);
+		timer = setTimeout(poll, POLL_INTERVAL_MS);
 		return ok({
 			mode: "polling",
 			close: async () => {
