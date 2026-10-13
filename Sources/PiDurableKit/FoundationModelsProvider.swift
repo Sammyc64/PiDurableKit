@@ -521,7 +521,10 @@ struct FoundationModelsResponder: Sendable {
                 }
             }
             let title = JSONValue.string(String(path.map { $0.isLetter || $0.isNumber ? $0 : "_" }))
-            if object["type"]?.stringValue == "object" {
+            // A map (`additionalProperties` with a schema) keeps its shape; a fixed object states everything.
+            if object["type"]?.stringValue == "object", object["additionalProperties"]?.objectValue != nil {
+                if object["title"] == nil { object["title"] = title }
+            } else if object["type"]?.stringValue == "object" {
                 let properties = object["properties"]?.objectValue ?? [:]
                 if object["properties"] == nil { object["properties"] = [:] }
                 if object["additionalProperties"] == nil { object["additionalProperties"] = false }

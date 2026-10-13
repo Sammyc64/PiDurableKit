@@ -361,6 +361,7 @@ struct FoundationModelsTests {
                 "properties": [
                     "value": ["title": "Value", "anyOf": [["type": "string"], ["type": "number"]]],
                     "mode": ["type": "string", "enum": ["a", "b"]],
+                    "labels": ["type": "object", "additionalProperties": ["type": "string"]],
                 ],
                 "required": ["value"],
             ],
