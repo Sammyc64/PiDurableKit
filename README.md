@@ -226,7 +226,9 @@ loaded with `AgentChange(modelTools: .edit(add: […]))` or `Extension.toolSearc
 conversation's tools (`await tools.forecast({ city: "Oslo" })`) as nested calls, in a QuickJS sandbox bundled as
 WebAssembly. A script survives a restart: it replays from a journal of the results it got and continues. Scripts run
 on the runtime's JavaScript thread, so one that computes without awaiting a tool holds up the runtime until its interrupt
-budget runs out.
+budget runs out: about 40 seconds by default on an iPhone 18 Pro, so apps may want a lower `interruptBudget`. It works
+on iOS devices; QuickJS computes slowly there as on a Mac (a 5-million-step loop takes about 4 seconds), and a script
+that mostly calls tools adds little (about 0.1 seconds).
 
 `harness.commit { tx in … }` and `conversation.commit { tx in … }` run any set of reads and writes atomically: create
 conversations and forks, append entries, create tasks, configure agents, and read or write documents. Throwing rolls

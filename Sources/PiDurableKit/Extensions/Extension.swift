@@ -150,8 +150,8 @@ public struct Extension: Sendable, Identifiable {
     /// tools scripts can call.
     ///
     /// Scripts run in QuickJS (WebAssembly) on the runtime's JavaScript thread: while a script computes without
-    /// awaiting a tool, the runtime's other work waits, up to `interruptBudget`. WebAssembly needs JavaScriptCore with
-    /// WebAssembly support, as on macOS and the iOS Simulator.
+    /// awaiting a tool, the runtime's other work waits, up to `interruptBudget`. JavaScriptCore runs WebAssembly on
+    /// macOS, iOS devices, and the iOS Simulator.
     public static func codemode(name: String = "codemode", _ options: CodemodeOptions = CodemodeOptions()) -> Extension {
         Extension(builtin: .codemode(options), name: name)
     }
@@ -637,7 +637,8 @@ public struct CodemodeOptions: Sendable {
     /// Give scripts `models.*`: the model catalog, classifiers, and image generation; default `true`.
     public var models: Bool?
     /// Interrupt polls a script may use computing without awaiting a tool before it fails as timed out; default
-    /// 100,000, roughly 2 to 10 seconds.
+    /// 100,000. On an iPhone 18 Pro, 100,000 is about 40 seconds and 10,000 about 4, during which the runtime's other
+    /// JavaScript work waits.
     public var interruptBudget: Int?
 
     public init(namespaces: [Namespace] = [], inlineBudget: Int? = nil, models: Bool? = nil, interruptBudget: Int? = nil) {
