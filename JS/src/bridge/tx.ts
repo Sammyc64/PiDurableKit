@@ -86,6 +86,7 @@ register({
 			ownership: taskOwnership(args),
 			...(args.conversation == null ? {} : { conversationId: args.conversation }),
 			...(args.background ? { background: true } : {}),
+			...(args.abandonOnRestart ? { abandonOnRestart: true } : {}),
 		});
 	},
 	"tx.readDoc": async (args) => JSON.parse(JSON.stringify(await draftOf(txOf(args).tx, args))),

@@ -170,6 +170,9 @@ public struct Settings: Codable, Sendable, Hashable {
     public var followUpMode: QueueMode?
     /// How long an idle conversation keeps its last context read in memory; zero drops it once idle. Default ten minutes.
     public var contextRetention: Duration?
+    /// How long a loaded document that nothing observes stays in memory after its last read or write; the next access
+    /// loads it from storage. Zero drops it right after use, `Duration.forever` keeps documents. Default ten minutes.
+    public var documentRetention: Duration?
 
     public init(
         extensions: [String]? = nil,
@@ -180,9 +183,11 @@ public struct Settings: Codable, Sendable, Hashable {
         toolExecution: ToolExecution? = nil,
         steeringMode: QueueMode? = nil,
         followUpMode: QueueMode? = nil,
-        contextRetention: Duration? = nil
+        contextRetention: Duration? = nil,
+        documentRetention: Duration? = nil
     ) {
         self.contextRetention = contextRetention
+        self.documentRetention = documentRetention
         self.extensions = extensions
         self.stream = stream
         self.retry = retry
@@ -204,6 +209,7 @@ public struct Settings: Codable, Sendable, Hashable {
         try container.encodeIfPresent(steeringMode, forKey: AnyKey("steeringMode"))
         try container.encodeIfPresent(followUpMode, forKey: AnyKey("followUpMode"))
         try container.encodeIfPresent(contextRetention?.milliseconds, forKey: AnyKey("contextRetentionMs"))
+        try container.encodeIfPresent(documentRetention?.milliseconds, forKey: AnyKey("documentRetentionMs"))
     }
 
     public init(from decoder: Decoder) throws {
@@ -217,10 +223,19 @@ public struct Settings: Codable, Sendable, Hashable {
         steeringMode = try container.decodeIfPresent(QueueMode.self, forKey: AnyKey("steeringMode"))
         followUpMode = try container.decodeIfPresent(QueueMode.self, forKey: AnyKey("followUpMode"))
         contextRetention = try container.decodeIfPresent(Double.self, forKey: AnyKey("contextRetentionMs")).map { Duration.milliseconds($0) }
+        // An infinite retention arrives as `null`.
+        if container.contains(AnyKey("documentRetentionMs")) {
+            documentRetention = try container.decodeIfPresent(Double.self, forKey: AnyKey("documentRetentionMs")).map { Duration.milliseconds($0) } ?? .forever
+        } else {
+            documentRetention = nil
+        }
     }
 }
 
 extension Duration {
+    /// A retention that never ends, for ``Settings/documentRetention``.
+    public static var forever: Duration { .seconds(Int64.max / 2) }
+
     var milliseconds: Double {
         let (seconds, attoseconds) = components
         return Double(seconds) * 1000 + Double(attoseconds) / 1e15

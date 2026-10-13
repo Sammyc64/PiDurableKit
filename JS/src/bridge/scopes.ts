@@ -7,13 +7,13 @@ import type {
 	EntryId,
 	HookApi,
 	InputSubmissionDraft,
+	JsonObject,
 	TaskId,
 	TaskRuntime,
 	ToolExecutionApi,
 } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
-import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
-import { type Args, closeHandle, emit, finish, handle, host, openHandle, openStream, register } from "./core.ts";
+import { type Args, closeHandle, emit, finish, handle, host, openHandle, openStream, register, watchEndError } from "./core.ts";
 import { draftOf, readDoc, watchArguments } from "./docs.ts";
 import { describeAgent, describeRegistry, describeSettings, describeTask, type HarnessState, resolveSettings, taskDefinition } from "./state.ts";
 import { runSwiftCommit, taskOwnership } from "./tx.ts";
@@ -68,64 +68,6 @@ function toolOf(scope: Scope): ToolExecutionApi {
 	return scope.tool;
 }
 
-function errorText(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-/** A result for a call that could not run, as the harness records one. */
-function failed(code: string, error: unknown) {
-	return { content: [], isError: true, diagnostics: [{ severity: "error", code, message: errorText(error) }] };
-}
-
-/**
- * Runs a tool the calling conversation is offered as the harness runs a tool call: repairs and validates the arguments,
- * then calls `execute()` with the calling tool's `api`. What the called tool reports (output, details, diagnostics)
- * goes into its own result instead of the caller's.
- */
-async function callTool(api: ToolExecutionApi, name: string, raw: unknown, context: Context) {
-	const agent = await api.agent(context);
-	const tool = agent.tools.find((candidate) => candidate.name === name);
-	if (tool === undefined) throw new Error(`Tool ${name} is not offered to this conversation`);
-	let args: unknown;
-	try {
-		const prepared = tool.prepareArguments === undefined ? raw : tool.prepareArguments(raw);
-		args = validateToolArguments(tool, { type: "toolCall", id: api.callId, name, arguments: prepared as Args });
-	} catch (error) {
-		return failed("invalid_arguments", error);
-	}
-	const output: string[] = [];
-	const diagnostics: unknown[] = [];
-	let details: JsonValue | undefined;
-	const decoder = new TextDecoder();
-	const reporting = {
-		...api,
-		output: (chunk: string | Uint8Array) => {
-			output.push(typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }));
-		},
-		outputWindow: undefined,
-		diagnostic: (diagnostic: unknown) => {
-			diagnostics.push(diagnostic);
-		},
-		details: async (value: JsonValue) => {
-			details = value;
-		},
-	} as ToolExecutionApi;
-	let result: Args;
-	try {
-		result = (await tool.execute(args as never, reporting, context)) as Args;
-	} catch (error) {
-		if (context.abortSignal?.aborted) throw error;
-		return failed("tool_error", error);
-	}
-	const streamed = output.join("") + decoder.decode();
-	return {
-		...result,
-		content: result.content ?? (streamed === "" ? [] : [{ type: "text", text: streamed }]),
-		...(result.details === undefined && details !== undefined ? { details } : {}),
-		diagnostics: [...diagnostics, ...(result.diagnostics ?? [])],
-	};
-}
-
 function runtimeOf(scope: Scope): AnyRuntime {
 	if (scope.runtime === undefined) throw new Error("Only task phases can do this");
 	return scope.runtime;
@@ -157,7 +99,7 @@ register({
 		emit(args.stream, watchHandle.value ?? args.doc.initial);
 		watchHandle.start(async (value) => emit(args.stream, value ?? args.doc.initial));
 		watchHandle.closed.then(
-			() => finish(args.stream),
+			(end) => finish(args.stream, watchEndError(end as { reason: string; error?: unknown })),
 			(error) => finish(args.stream, error),
 		);
 	},
@@ -180,14 +122,22 @@ register({
 	"scope.agent": async (args, context) => describeAgent(await taskOwner(scopeOf(args)).agent(context)),
 	"scope.tools": async (args, context) => {
 		const agent = await toolOf(scopeOf(args)).agent(context);
-		return agent.tools.map((tool) => ({
+		return (args.callable ? agent.callable : agent.tools).map((tool) => ({
 			name: tool.name,
 			description: tool.description,
 			parameters: tool.parameters,
 			extension: agent.extensions.find((extension) => extension.tools?.some((candidate) => candidate.name === tool.name))?.name ?? null,
 		}));
 	},
-	"scope.callTool": (args, context) => callTool(toolOf(scopeOf(args)), args.name, args.arguments ?? {}, context),
+	/** `api.executeTool()`: a durable nested call of another tool, owned by this one. */
+	"scope.executeTool": (args, context) =>
+		toolOf(scopeOf(args)).executeTool(args.name, (args.arguments ?? {}) as JsonObject, context, {
+			...(args.key == null ? {} : { key: args.key }),
+			...(args.progress == null ? {} : { progress: args.progress }),
+		}),
+	"scope.retainedOutput": (args) => toolOf(scopeOf(args)).retainedOutput(),
+	"scope.ownedTasks": async (args, context) => (await runtimeOf(scopeOf(args)).ownedTasks(context)).map(describeTask),
+	"scope.abortOwned": (args, context) => runtimeOf(scopeOf(args)).abortOwned(args.task as TaskId, context),
 	"scope.getTask": async (args, context) => describeTask(await taskOwner(scopeOf(args)).getTask(args.task as TaskId, context)),
 	"scope.waitForTask": async (args, context) => describeTask(await taskOwner(scopeOf(args)).waitForTask(args.task as TaskId, context)),
 	"scope.conversation": async (args, context) => {
@@ -222,6 +172,7 @@ register({
 				// A tool's tasks belong to its call unless they are top-level work of the conversation.
 				ownership: args.ownedByConversation ? { kind: "conversation" } : taskOwnership({ ownerTask: scope.tool.taskId }),
 				...(args.background ? { background: true } : {}),
+				...(args.abandonOnRestart == null ? {} : { abandonOnRestart: args.abandonOnRestart }),
 			},
 			context,
 		);

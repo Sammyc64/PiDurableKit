@@ -19,14 +19,53 @@ import {
 	wrapSection,
 	wrapTool,
 } from "@earendil-works/pi-durable";
-import { createBashTool, createEditTool, createPowerShellTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
+import { createToolSearchExtension } from "@earendil-works/pi-durable/tool-search";
+import {
+	createBashTool,
+	createEditTool,
+	createPowerShellTool,
+	createReadTool,
+	createWriteTool,
+	type ImageProcessor,
+	type PreparedImage,
+} from "@earendil-works/pi-durable/tools";
+import { InlineCodemodeSandbox } from "@earendil-works/pi-codemode/portable";
+import { native } from "../runtime/native.ts";
 import { type Args, handle, host, hostSync, register } from "./core.ts";
-import { fromBase64 } from "./env.ts";
+import { fromBase64, toBase64 } from "./env.ts";
 import { evaluateExtension } from "./javascript.ts";
 import { type Scope, withScope } from "./scopes.ts";
 import { describeAgent, describeTask, type HarnessState } from "./state.ts";
 
 type Next = { next: (input?: unknown) => Promise<unknown> };
+
+/** QuickJS for code mode, compiled once per runtime. */
+const quickJSModules = new Map<string, Promise<object>>();
+function quickJS(path: string): Promise<object> {
+	let compiled = quickJSModules.get(path);
+	if (compiled === undefined) {
+		compiled = WebAssembly.compile(native.fsReadFile(path) as BufferSource);
+		quickJSModules.set(path, compiled);
+		compiled.catch(() => quickJSModules.delete(path));
+	}
+	return compiled;
+}
+
+/** pi-durable's `ImageProcessor` for `read`, implemented in Swift (`ImageProcessor`, ImageIO by default). */
+function hostImages(state: HarnessState, extension: string, index: number): ImageProcessor {
+	return {
+		prepare: async (bytes, mimeType, limits) =>
+			(await host<PreparedImage | null>("images.prepare", {
+				harness: state.id,
+				extension,
+				index,
+				data: toBase64(bytes),
+				mimeType,
+				limits,
+			})) ?? undefined,
+	};
+}
 
 /** Builds the pi-durable extension for a Swift `Extension.specification`. */
 export function buildExtension(state: HarnessState, spec: Args): Extension {
@@ -34,6 +73,24 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 	const base = { harness: state.id, extension: name };
 
 	if (typeof spec.javaScript === "string") return evaluateExtension(spec.javaScript, name, spec.sourceURL ?? undefined);
+
+	if (spec.builtin === "toolSearch") return defineExtension({ ...createToolSearchExtension(), name });
+	if (spec.builtin === "codemode") {
+		const sandbox = new InlineCodemodeSandbox({
+			// QuickJS, compiled once per runtime from the copy Swift bundles.
+			wasm: quickJS(spec.wasmPath),
+			...(spec.interruptBudget == null ? {} : { interruptBudget: spec.interruptBudget }),
+		});
+		return defineExtension({
+			...createCodemodeExtension({
+				sandbox,
+				...(spec.namespaces == null ? {} : { namespaces: spec.namespaces }),
+				...(spec.inlineBudget == null ? {} : { inlineBudget: spec.inlineBudget }),
+				...(spec.models == null ? {} : { models: spec.models }),
+			}),
+			name,
+		});
+	}
 
 	if (spec.builtin === "tools") {
 		const prepare = (item: Args) =>
@@ -65,7 +122,7 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 		const tools = (spec.builtinTools as Args[]).map((item) => {
 			switch (item.kind) {
 				case "read":
-					return createReadTool();
+					return createReadTool(item.images ? { images: hostImages(state, name, item.index) } : {});
 				case "write":
 					return createWriteTool();
 				case "edit":
@@ -87,6 +144,9 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 			...(tool.replay ? { replay: tool.replay } : {}),
 			...(tool.executionMode ? { executionMode: tool.executionMode } : {}),
 			...(tool.outputLimits ? { outputLimits: tool.outputLimits } : {}),
+			...(tool.structuredOutputSchema ? { structuredOutputSchema: tool.structuredOutputSchema } : {}),
+			...(tool.callers ? { callers: tool.callers } : {}),
+			...(tool.deferred ? { deferred: true } : {}),
 			...(tool.prepares
 				? { prepareArguments: (raw: unknown) => hostSync("tool.prepare", { ...base, tool: tool.name, arguments: raw ?? null }) as never }
 				: {}),
@@ -202,6 +262,9 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 							replay: tool.replay ?? null,
 							executionMode: tool.executionMode ?? null,
 							outputLimits: tool.outputLimits ?? null,
+							structuredOutputSchema: tool.structuredOutputSchema ?? null,
+							callers: tool.callers ?? null,
+							deferred: tool.deferred === true,
 						},
 					});
 					Object.assign(wrapped, {
@@ -210,7 +273,11 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 						...(definition.replay == null ? {} : { replay: definition.replay }),
 						...(definition.executionMode == null ? {} : { executionMode: definition.executionMode }),
 						...(definition.outputLimits == null ? {} : { outputLimits: definition.outputLimits }),
+						...(definition.structuredOutputSchema == null ? {} : { structuredOutputSchema: definition.structuredOutputSchema }),
+						...(definition.callers == null ? {} : { callers: definition.callers }),
 					});
+					if (definition.deferred === true) Object.assign(wrapped, { deferred: true });
+					else delete (wrapped as { deferred?: true }).deferred;
 				}
 				if (wrap.prepares) {
 					wrapped.prepareArguments = (raw: unknown) => {

@@ -8,4 +8,4 @@ export interface StorageConformanceRunner {
 /** Registers the runner-independent cases with a Vitest/Jest-compatible test runner. */
 export declare function registerStorageConformance(runner: StorageConformanceRunner, name: string, withStorage: StorageConformanceProvider): void;
 /** Registers the runner-independent `ExecutionEnv` cases with a Vitest/Jest-compatible test runner. */
-export declare function registerEnvConformance(runner: StorageConformanceRunner, name: string, withEnv: EnvConformanceProvider, options?: Pick<EnvConformanceOptions, "shell" | "symlinks">): void;
+export declare function registerEnvConformance(runner: StorageConformanceRunner, name: string, withEnv: EnvConformanceProvider, options?: Pick<EnvConformanceOptions, "shell" | "symlinks" | "listFiles">): void;

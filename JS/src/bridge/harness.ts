@@ -20,7 +20,7 @@ import {
 	watchEvents,
 	type WatchHandle,
 } from "@earendil-works/pi-durable";
-import { type Args, emit, finish, host, hostSync, openStream, register, serializeError, withHandle } from "./core.ts";
+import { type Args, emit, finish, host, hostSync, openStream, register, serializeError, watchEndError, withHandle } from "./core.ts";
 import { applyDeep, draftOf, readDoc, retireDoc, watchArguments } from "./docs.ts";
 import { environmentOf } from "./env.ts";
 import { withScope } from "./scopes.ts";
@@ -36,6 +36,7 @@ import {
 	describeTask,
 	type HarnessState,
 	harnessState,
+	endings,
 	harnesses,
 	resolveSettings,
 } from "./state.ts";
@@ -75,6 +76,11 @@ function liveSettings(state: HarnessState): HarnessSettings {
 		get contextRetentionMs() {
 			return value().contextRetentionMs;
 		},
+		get documentRetentionMs() {
+			// Swift has no infinite duration: a retention of a million years or more keeps documents.
+			const ms = value().documentRetentionMs;
+			return typeof ms === "number" && ms >= 3.15e16 ? Number.POSITIVE_INFINITY : ms;
+		},
 	};
 }
 
@@ -97,7 +103,7 @@ function pipe<T>(stream: number, watch: WatchHandle<T>, map: (value: T, ops: rea
 	emit(stream, map(watch.value, []));
 	watch.start(async (value, ops) => emit(stream, map(value, ops)));
 	watch.closed.then(
-		(end) => finish(stream, end.reason === "listener_error" ? end.error : undefined),
+		(end) => finish(stream, watchEndError(end)),
 		(error) => finish(stream, error),
 	);
 }
@@ -147,6 +153,7 @@ register({
 			context,
 		);
 		harnesses.set(args.id, state);
+		endings.set(args.id, state.harness.closed);
 		if (args.resume !== false) state.harness.resume();
 	},
 	"harness.close": async (args, context) => {
@@ -323,7 +330,7 @@ register({
 		emit(stream, [events.snapshot]);
 		events.start(async (batch) => emit(stream, batch));
 		events.closed.then(
-			(end) => finish(stream, end.reason === "listener_error" ? end.error : undefined),
+			(end) => finish(stream, watchEndError(end)),
 			(error) => finish(stream, error),
 		);
 	},

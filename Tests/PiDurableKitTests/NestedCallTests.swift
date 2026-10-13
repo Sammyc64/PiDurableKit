@@ -10,7 +10,7 @@ private let shoutSource = """
         name: "shout",
         tools: [defineTool({
             name: "shout", description: "Shout a word", parameters: Type.Object({ word: Type.String() }),
-            execute: async (args) => ({ content: [{ type: "text", text: args.word.toUpperCase() + "!" }] }),
+            execute: async (args) => ({ output: [{ type: "text", text: args.word.toUpperCase() + "!" }] }),
         })],
     });
     """
@@ -44,7 +44,7 @@ private let calleeTools: [Tool] = [
     },
 ]
 
-@Suite struct CallToolTests {
+@Suite struct NestedCallTests {
     /// Runs `body` as the tool `caller` in one model turn, and returns what the caller's result shows.
     private func run(
         offering tools: AgentChange.Tools? = nil, _ body: @escaping @Sendable (ToolCallContext) async throws -> ToolResult
@@ -80,24 +80,24 @@ private let calleeTools: [Tool] = [
 
     @Test func callsSwiftAndJavaScriptToolsInParallel() async throws {
         let (result, _, root) = try await run { call in
-            async let echo = call.callTool("echo", arguments: Word(word: "hi"))
-            async let shout = call.callTool("shout", arguments: ["word": "hey"])
+            async let echo = call.executeTool("echo", arguments: Word(word: "hi"))
+            async let shout = call.executeTool("shout", arguments: ["word": "hey"])
             let results = try await [echo, shout]
-            return .text(results.map { $0.content?.compactMap(\.text).joined() ?? "" }.joined(separator: ", "))
+            return .text(results.map(\.text).joined(separator: ", "))
         }
         #expect(result.text == "echo hi, HEY!")
-        // The called tools are part of the caller's call: one tool result in the transcript.
+        // Nested calls return to their caller instead of the transcript: one tool result.
         #expect(try await root.view().entries.filter { $0.kind == .toolResult }.count == 1)
     }
 
-    @Test func reportsGoIntoTheCalledToolsResult() async throws {
-        let called = Mutex<ToolResult?>(nil)
+    @Test func reportsGoIntoTheNestedResult() async throws {
+        let called = Mutex<NestedToolResult?>(nil)
         let (result, _, _) = try await run { call in
-            called.set(try await call.callTool("stream"))
+            called.set(try await call.executeTool("stream"))
             return "caller's own result"
         }
         let streamed = try #require(called.get())
-        #expect(streamed.content?.compactMap(\.text).joined() == "one two")
+        #expect(streamed.structuredOutput == "one two")
         #expect(streamed.details?["step"] == 2)
         #expect(streamed.diagnostics.map(\.code) == ["note"])
         #expect(result.text == "caller's own result")
@@ -105,42 +105,44 @@ private let calleeTools: [Tool] = [
     }
 
     @Test func repairsAndValidatesArgumentsAsTheHarnessDoes() async throws {
-        let results = Mutex<[ToolResult]>([])
+        let results = Mutex<[NestedToolResult]>([])
         _ = try await run { call in
             results.set([
-                try await call.callTool("join", arguments: ["items": #"["a","b"]"#]),
-                try await call.callTool("echo", arguments: ["word": 42]),
-                try await call.callTool("echo", arguments: [:]),
-                try await call.callTool("broken"),
+                try await call.executeTool("join", arguments: ["items": #"["a","b"]"#]),
+                try await call.executeTool("echo", arguments: ["word": 42]),
+                try await call.executeTool("echo", arguments: [:]),
+                try await call.executeTool("broken"),
             ])
             return "ok"
         }
         let (join, coerced, missing, broken) = try #require(results.get().count == 4 ? results.get() : nil).splat
-        #expect(join.content?.compactMap(\.text).joined() == "a+b")
+        #expect(join.text == "a+b")
         // pi-ai's validation coerces a number to the schema's string.
-        #expect(coerced.content?.compactMap(\.text).joined() == "echo 42")
+        #expect(coerced.text == "echo 42")
         #expect(missing.isError)
-        #expect(missing.diagnostics.first?.code == "invalid_arguments")
         #expect(broken.isError)
-        #expect(broken.diagnostics.first?.code == "tool_error")
-        #expect(broken.diagnostics.first?.message.contains("The broken tool broke") == true)
+        #expect(broken.diagnostics.contains { $0.message.contains("The broken tool broke") })
     }
 
-    @Test func onlyOfferedToolsCanBeCalled() async throws {
-        let outcome = Mutex<String>("")
-        let offered = Mutex<[String]>([])
+    @Test func onlyCallableToolsCanBeCalled() async throws {
+        let outcome = Mutex<NestedToolResult?>(nil)
+        let offered = Mutex<([String], [String])>(([], []))
         _ = try await run(offering: .only(["caller", "echo"])) { call in
-            offered.set(try await call.tools().map(\.name))
-            do {
-                _ = try await call.callTool("shout", arguments: ["word": "hey"])
-                outcome.set("called")
-            } catch {
-                outcome.set("\(error)")
-            }
+            offered.set((try await call.tools().map(\.name), try await call.callableTools().map(\.name)))
+            outcome.set(try await call.executeTool("shout", arguments: ["word": "hey"]))
             return "ok"
         }
-        #expect(offered.get() == ["caller", "echo"])
-        #expect(outcome.get().contains("Tool shout is not offered to this conversation"))
+        #expect(offered.get().0 == ["caller", "echo"])
+        #expect(offered.get().1 == ["caller", "echo"])
+        #expect(outcome.get()?.isError == true)
+    }
+
+    @Test func deprecatedCallToolStillWorks() async throws {
+        let (result, _, _) = try await run { call in
+            let echoed = try await call.callTool("echo", arguments: Word(word: "hi"))
+            return .text(echoed.output?.compactMap(\.text).joined() ?? "")
+        }
+        #expect(result.text == "echo hi")
     }
 }
 

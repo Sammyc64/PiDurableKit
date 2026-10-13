@@ -6,6 +6,7 @@
 //   ../Sources/PiDurableKit/Resources/pi-durable.js   the bundle (committed)
 //   ../Sources/PiDurableKit/Resources/Documentation   pi-durable's README and type declarations (committed)
 //   ../Sources/PiDurableKit/Resources/ThirdPartyNotices.txt  licenses of every package in the bundle (committed)
+//   ../Sources/PiDurableKit/Resources/quickjs.wasm  QuickJS for code mode (committed)
 //   ../Sources/PiDurableKit/Generated/Versions.swift  the bundled package versions
 //   src/versions.ts                                 the same versions for JavaScript
 import { build } from "esbuild";
@@ -22,6 +23,7 @@ const versions = {
 	piDurable: version("@earendil-works/pi-durable"),
 	piAI: version("@earendil-works/pi-ai"),
 	chord: version("@earendil-works/chord"),
+	piCodemode: version("@earendil-works/pi-codemode"),
 };
 
 writeFileSync(
@@ -41,6 +43,8 @@ extension PiDurable {
     public static let piAIVersion = "${versions.piAI}"
     /// The version of \`@earendil-works/chord\` bundled into this package.
     public static let chordVersion = "${versions.chord}"
+    /// The version of \`@earendil-works/pi-codemode\` bundled into this package.
+    public static let piCodemodeVersion = "${versions.piCodemode}"
 }
 `,
 );
@@ -69,6 +73,9 @@ function copyDocumentation() {
 }
 
 copyDocumentation();
+
+/** QuickJS compiled to WebAssembly, which code mode runs scripts in; loaded from the resources at first use. */
+cpSync(resolve(root, "node_modules/quickjs-wasi/quickjs.wasm"), resolve(root, "../Sources/PiDurableKit/Resources/quickjs.wasm"));
 
 const shims = [
 	{ module: "node:sqlite", file: "src/shims/node-sqlite.ts", importers: ["pi-durable/dist/storage/sqlite/node"] },

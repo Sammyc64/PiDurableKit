@@ -314,8 +314,14 @@ public struct InboxItem: Codable, Sendable, Hashable, Identifiable {
     public let mode: Mode
     /// The queued user input (steers and follow-ups).
     public let content: JSONValue?
-    /// The queued entry (writes).
+    /// The queued entry (writes), or the entry an input is placed as instead of `pi.user`.
     public let entry: JSONValue?
+
+    /// The entry a queued input is placed as, when not `pi.user`.
+    public var inputEntry: InputEntry? {
+        guard mode != .write else { return nil }
+        return try? entry?.decode(as: InputEntry.self)
+    }
 
     /// The queued input's text.
     public var text: String {

@@ -14,12 +14,12 @@ public enum AgentEvent: Sendable, Hashable {
     /// Changes to the in-flight assistant message, with its current usage.
     case messageUpdate(changes: [MessageChange], usage: Usage)
     case messageEnd(Entry)
-    case toolExecutionStart(callId: String, toolName: String, arguments: JSONObject)
+    case toolExecutionStart(ToolEventCall, arguments: JSONObject)
     /// `diagnostics` is the call's whole diagnostics list, when it changed.
-    case toolExecutionUpdate(
-        callId: String, toolName: String, output: OutputChange?, details: JSONValue?, diagnostics: [ToolDiagnostic]?)
-    /// `entry` is absent when the tool task faulted or was orphaned.
-    case toolExecutionEnd(callId: String, toolName: String, entry: Entry?)
+    case toolExecutionUpdate(ToolEventCall, output: OutputChange?, details: JSONValue?, diagnostics: [ToolDiagnostic]?)
+    /// A model-issued call ends with its result `entry`, a nested call with its `result`. Both are absent when the
+    /// tool task faulted or was orphaned, or when the call ended unfinished.
+    case toolExecutionEnd(ToolEventCall, entry: Entry?, result: NestedToolResult?)
     case inboxUpdate([QueuedItem])
     case submission(SubmissionRecord)
     case autoRetryStart(attempt: Int, at: Date, errorMessage: String)
@@ -31,7 +31,8 @@ public enum AgentEvent: Sendable, Hashable {
     case usageChanged(UsageState)
     case taskFailed(taskId: TaskID, kind: String, message: String)
     case compactionStart(taskId: TaskID, reason: CompactionReason, blocking: Bool)
-    case compactionEnd(taskId: TaskID, reason: CompactionReason)
+    /// `error` is set when the compaction failed, faulted, or was orphaned.
+    case compactionEnd(taskId: TaskID, reason: CompactionReason, error: String?)
     /// An event this version of PiDurableKit does not know.
     case other(type: String, JSONValue)
 
@@ -45,13 +46,19 @@ public enum AgentEvent: Sendable, Hashable {
         /// The in-flight partial response, if a generation is streaming.
         public var message: AssistantMessage? { generation?.message }
         public let tools: [LiveState.ToolSlot]
+        /// Nested calls of running tool calls.
+        public let nestedTools: [LiveState.NestedToolSlot]
         /// Live compactions with their attempt and retry backoff.
         public let compactions: [CompactionStatus]
+        /// The newest compaction failure since a compaction last produced a summary.
+        public let compactionFailure: CompactionFailure?
         public let inbox: [QueuedItem]
         public let agent: AgentState
         public let usage: UsageState
 
-        private enum CodingKeys: String, CodingKey { case entries, run, generation, tools, compactions, inbox, agent, usage }
+        private enum CodingKeys: String, CodingKey {
+            case entries, run, generation, tools, nestedTools, compactions, compactionFailure, inbox, agent, usage
+        }
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -59,7 +66,9 @@ public enum AgentEvent: Sendable, Hashable {
             run = try container.decodeIfPresent(JSONValue.self, forKey: .run)?["inputs"].flatMap { try? $0.decode(as: [SubmissionID].self) }
             generation = try? container.decodeIfPresent(GenerationStatus.self, forKey: .generation)
             tools = (try? container.decodeIfPresent([LiveState.ToolSlot].self, forKey: .tools)) ?? []
+            nestedTools = (try? container.decodeIfPresent([LiveState.NestedToolSlot].self, forKey: .nestedTools)) ?? []
             compactions = (try? container.decodeIfPresent([CompactionStatus].self, forKey: .compactions)) ?? []
+            compactionFailure = try? container.decodeIfPresent(CompactionFailure.self, forKey: .compactionFailure)
             inbox = (try? container.decodeIfPresent([QueuedItem].self, forKey: .inbox)) ?? []
             agent = (try? container.decodeIfPresent(AgentState.self, forKey: .agent)) ?? AgentState()
             usage = (try? container.decodeIfPresent(UsageState.self, forKey: .usage)) ?? UsageState()
@@ -77,6 +86,28 @@ public enum AgentEvent: Sendable, Hashable {
         case append(String, trimStart: Int)
         /// Replace the whole output.
         case set(String)
+    }
+}
+
+/// Which call a tool event is about (pi-durable `ToolEventCall`). Match events by ``callId``; don't parse it.
+public struct ToolEventCall: Sendable, Hashable {
+    /// The provider's ID for a model-issued call, `<parent call ID>/<key>` for a nested one.
+    public let callId: String
+    public let toolName: String
+    /// The call's tool task; `nil` for a call that never got one.
+    public let taskId: TaskID?
+    /// For a nested call: the call that made it.
+    public let parentCallId: String?
+    public let parentTaskId: TaskID?
+
+    public var isNested: Bool { parentCallId != nil }
+
+    init(_ json: JSONValue) {
+        callId = json["toolCallId"]?.stringValue ?? ""
+        toolName = json["toolName"]?.stringValue ?? ""
+        taskId = json["taskId"]?.intValue.map { TaskID($0) }
+        parentCallId = json["parentToolCallId"]?.stringValue
+        parentTaskId = json["parentTaskId"]?.intValue.map { TaskID($0) }
     }
 }
 
@@ -149,8 +180,7 @@ extension AgentEvent: Decodable {
             return .messageUpdate(changes: try value("changes"), usage: (try? value("usage")) ?? Usage())
         case "message_end": return .messageEnd(try value("entry"))
         case "tool_execution_start":
-            return .toolExecutionStart(
-                callId: string("toolCallId"), toolName: string("toolName"), arguments: json["args"]?.objectValue ?? [:])
+            return .toolExecutionStart(ToolEventCall(json), arguments: json["args"]?.objectValue ?? [:])
         case "tool_execution_update":
             var output: OutputChange?
             if let set = json["output"]?["set"]?.stringValue {
@@ -159,11 +189,12 @@ extension AgentEvent: Decodable {
                 output = .append(change["append"]?.stringValue ?? "", trimStart: change["trimStart"]?.intValue ?? 0)
             }
             return .toolExecutionUpdate(
-                callId: string("toolCallId"), toolName: string("toolName"), output: output, details: json["details"],
+                ToolEventCall(json), output: output, details: json["details"],
                 diagnostics: json["diagnostics"].flatMap { try? $0.decode(as: [ToolDiagnostic].self) })
         case "tool_execution_end":
             return .toolExecutionEnd(
-                callId: string("toolCallId"), toolName: string("toolName"), entry: try? value("entry", as: Entry.self))
+                ToolEventCall(json), entry: try? value("entry", as: Entry.self),
+                result: try? value("result", as: NestedToolResult.self))
         case "inbox_update": return .inboxUpdate(try value("items"))
         case "submission": return .submission(try value("record"))
         case "auto_retry_start":
@@ -183,7 +214,8 @@ extension AgentEvent: Decodable {
                 taskId: try value("taskId"), reason: CompactionReason(rawValue: string("reason")),
                 blocking: json["blocking"]?.boolValue ?? false)
         case "compaction_end":
-            return .compactionEnd(taskId: try value("taskId"), reason: CompactionReason(rawValue: string("reason")))
+            return .compactionEnd(
+                taskId: try value("taskId"), reason: CompactionReason(rawValue: string("reason")), error: json["error"]?.stringValue)
         default: return .other(type: type, json)
         }
     }

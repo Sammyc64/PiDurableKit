@@ -16,7 +16,10 @@ import {
 	FileError,
 	type FileErrorCode,
 	type FileInfo,
+	type FileListEntry,
+	type FileListing,
 	type FileWatcher,
+	type ListFilesOptions,
 	LineScanner,
 	type LineScan,
 	ok,
@@ -392,6 +395,96 @@ export class BackendEnv implements ExecutionEnv {
 		}
 	}
 
+	/**
+	 * Every file, directory, and symbolic link below a directory, depth first with siblings in name order, skipping
+	 * `.git`, hidden names unless `hidden`, `exclude` names, and inside a git work tree what its ignore files ignore.
+	 */
+	async listFiles(path: string, options: ListFilesOptions | undefined, context: Context): Promise<Result<FileListing, FileError>> {
+		const absolute = this.#path(path);
+		const invalid = (message: string) => err<never, FileError>(new FileError("invalid", message, absolute));
+		const maxEntries = options?.maxEntries ?? 50_000;
+		const maxBytes = options?.maxBytes ?? 4 * 1024 * 1024;
+		const timeoutMs = options?.timeoutMs ?? 10_000;
+		if (!Number.isSafeInteger(maxEntries) || maxEntries < 0) return invalid("maxEntries must be a non-negative integer");
+		if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > 15.9 * 1024 * 1024) return invalid("maxBytes is out of range");
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) return invalid("timeoutMs must be a non-negative integer");
+		const stop = aborted(context, absolute);
+		if (stop) return stop;
+		return this.#run(absolute, context, async () => {
+			const root = await this.backend.stat(absolute, true);
+			if (root.kind !== "directory") throw Object.assign(new Error(`${absolute}: not a directory`), { code: "not_directory" });
+			const hidden = options?.hidden !== false;
+			const excluded = new Set(options?.exclude ?? []);
+			const ignore = options?.gitignore === false ? undefined : await this.#ignoreRules(absolute);
+			const deadline = Date.now() + timeoutMs;
+			const entries: FileListEntry[] = [];
+			let bytes = 0;
+			let truncated = false;
+			const walk = async (directory: string, relative: string, rules: IgnoreRules | undefined): Promise<boolean> => {
+				if (context.abortSignal?.aborted) throw Object.assign(new Error("Operation aborted"), { code: "aborted" });
+				let children: NativeInfo[];
+				try {
+					children = await this.backend.list(directory);
+				} catch (error) {
+					if (relative === "") throw error;
+					return true; // Entries that cannot be read are skipped.
+				}
+				children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+				const local = rules === undefined ? undefined : await rules.descend(directory, this.backend);
+				for (const child of children) {
+					if (child.name === ".git" || excluded.has(child.name)) continue;
+					if (!hidden && child.name.startsWith(".")) continue;
+					const path = relative === "" ? child.name : `${relative}/${child.name}`;
+					const full = normalize(child.name, directory);
+					if (local?.ignores(full, child.kind === "directory")) continue;
+					const size = utf8Length(path) + 2;
+					if (entries.length >= maxEntries || bytes + size > maxBytes || Date.now() > deadline) {
+						truncated = true;
+						return false;
+					}
+					entries.push({ path, kind: child.kind });
+					bytes += size;
+					if (child.kind === "directory" && !(await walk(full, path, local))) return false;
+				}
+				return true;
+			};
+			await walk(absolute, "", ignore);
+			return { entries, truncated };
+		});
+	}
+
+	/** The ignore rules in effect at `directory` when it is inside a git work tree. */
+	async #ignoreRules(directory: string): Promise<IgnoreRules | undefined> {
+		const exists = async (path: string) => {
+			try {
+				await this.backend.stat(path, false);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		let top: string | undefined;
+		for (let candidate = directory; ; candidate = parentOf(candidate)) {
+			if (await exists(normalize(".git", candidate))) {
+				top = candidate;
+				break;
+			}
+			if (candidate === "/") break;
+		}
+		if (top === undefined) return undefined;
+		let rules = new IgnoreRules(top, []);
+		rules = rules.with(top, await readIgnoreFile(this.backend, normalize(".git/info/exclude", top)));
+		// The parents' `.gitignore` files, from the work tree's top down to the listed directory's parent; the listed
+		// directory's own is added when the walk enters it.
+		const parents: string[] = [];
+		for (let candidate = directory; candidate !== top; ) {
+			candidate = parentOf(candidate);
+			parents.unshift(candidate);
+		}
+		for (const parent of parents) rules = await rules.descend(parent, this.backend);
+		return rules;
+	}
+
 	async canonicalPath(path: string, context: Context): Promise<Result<string, FileError>> {
 		return this.#run(path, context, (absolute) => this.backend.realpath(absolute));
 	}
@@ -728,4 +821,112 @@ export class HostBackend implements EnvBackend {
 export function environmentOf(spec: Args, cwd: string | undefined): ExecutionEnv {
 	if (typeof spec.custom === "string") return new BackendEnv(new HostBackend(spec.custom, spec.id, spec.shell === true), cwd ?? spec.cwd ?? "/");
 	return new SandboxEnv(spec.root, cwd ?? "/", spec.shell === true);
+}
+
+// MARK: Ignore files
+
+function parentOf(path: string): string {
+	return path.slice(0, path.lastIndexOf("/")) || "/";
+}
+
+function utf8Length(text: string): number {
+	return encoder.encode(text).byteLength;
+}
+
+async function readIgnoreFile(backend: EnvBackend, path: string): Promise<string> {
+	try {
+		return new TextDecoder().decode(await backend.read(path));
+	} catch {
+		return "";
+	}
+}
+
+type IgnoreRule = { readonly base: string; readonly regex: RegExp; readonly negate: boolean; readonly directoryOnly: boolean; readonly anchored: boolean };
+
+/** A glob of an ignore file as a regular expression over `/`-separated paths. */
+function globSource(glob: string): string {
+	let source = "";
+	for (let index = 0; index < glob.length; index++) {
+		const char = glob[index]!;
+		if (char === "*") {
+			if (glob[index + 1] === "*") {
+				const atStart = index === 0 || glob[index - 1] === "/";
+				const atEnd = index + 2 === glob.length || glob[index + 2] === "/";
+				if (atStart && atEnd) {
+					if (index + 2 === glob.length) source += ".*";
+					else {
+						source += "(?:.*/)?";
+						index++;
+					}
+					index++;
+					continue;
+				}
+				index++;
+			}
+			source += "[^/]*";
+		} else if (char === "?") source += "[^/]";
+		else if (char === "[") {
+			const close = glob.indexOf("]", index + 2);
+			if (close === -1) source += "\\[";
+			else {
+				let body = glob.slice(index + 1, close).replace(/\\/g, "\\\\");
+				if (body.startsWith("!")) body = `^${body.slice(1)}`;
+				source += `[${body}]`;
+				index = close;
+			}
+		} else if (char === "\\" && index + 1 < glob.length) source += `\\${glob[++index]}`;
+		else source += char.replace(/[.+^${}()|\]\\/]/g, "\\$&");
+	}
+	return source;
+}
+
+function parseIgnore(base: string, text: string): IgnoreRule[] {
+	const rules: IgnoreRule[] = [];
+	for (let line of text.split(/\r?\n/)) {
+		if (line === "" || line.startsWith("#")) continue;
+		line = line.replace(/(?<!\\)\s+$/, "");
+		if (line === "") continue;
+		let negate = false;
+		if (line.startsWith("!")) {
+			negate = true;
+			line = line.slice(1);
+		} else if (line.startsWith("\\!") || line.startsWith("\\#")) line = line.slice(1);
+		const directoryOnly = line.endsWith("/");
+		if (directoryOnly) line = line.slice(0, -1);
+		const anchored = line.includes("/");
+		if (line.startsWith("/")) line = line.slice(1);
+		if (line === "") continue;
+		rules.push({ base, regex: new RegExp(`^${globSource(line)}$`), negate, directoryOnly, anchored });
+	}
+	return rules;
+}
+
+/** The ignore rules of a work tree in effect at one directory, lowest precedence first; the last match wins. */
+class IgnoreRules {
+	constructor(
+		readonly top: string,
+		readonly rules: readonly IgnoreRule[],
+	) {}
+
+	with(base: string, text: string): IgnoreRules {
+		const added = parseIgnore(base, text);
+		return added.length === 0 ? this : new IgnoreRules(this.top, [...this.rules, ...added]);
+	}
+
+	/** These rules with `directory`'s own `.gitignore` added. */
+	async descend(directory: string, backend: EnvBackend): Promise<IgnoreRules> {
+		return this.with(directory, await readIgnoreFile(backend, normalize(".gitignore", directory)));
+	}
+
+	ignores(path: string, isDirectory: boolean): boolean {
+		let ignored = false;
+		for (const rule of this.rules) {
+			if (rule.directoryOnly && !isDirectory) continue;
+			if (!(path === rule.base || path.startsWith(rule.base === "/" ? "/" : `${rule.base}/`))) continue;
+			const relative = path.slice(rule.base === "/" ? 1 : rule.base.length + 1);
+			const subject = rule.anchored ? relative : relative.slice(relative.lastIndexOf("/") + 1);
+			if (rule.regex.test(subject)) ignored = !rule.negate;
+		}
+		return ignored;
+	}
 }

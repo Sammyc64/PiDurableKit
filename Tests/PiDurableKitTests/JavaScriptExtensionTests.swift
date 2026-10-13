@@ -16,7 +16,7 @@ module.exports = defineExtension({
             parameters: Type.Object({ sides: Type.Number() }),
             execute: async (args, api) => {
                 api.output("rolling\n");
-                return { content: [{ type: "text", text: `rolled a d${args.sides}: ${args.sides}` }], details: { sides: args.sides } };
+                return { output: [{ type: "text", text: `rolled a d${args.sides}: ${args.sides}` }], details: { sides: args.sides } };
             },
         }),
         defineTool({
@@ -24,7 +24,7 @@ module.exports = defineExtension({
             description: "Report what the extension can see",
             parameters: Type.Object({}),
             execute: async () => ({
-                content: [{ type: "text", text: [typeof __native, typeof __bridge, typeof __runtime, typeof fetch].join(" ") }],
+                output: [{ type: "text", text: [typeof __native, typeof __bridge, typeof __runtime, typeof fetch].join(" ") }],
             }),
         }),
     ],
@@ -69,7 +69,7 @@ module.exports = defineExtension({
                 parameters: Type.Object({}),
                 execute: async () => {
                     for (const delay of [Infinity, NaN, -1, 1e300]) clearTimeout(setTimeout(() => {}, delay));
-                    return { content: [{ type: "text", text: "armed" }] };
+                    return { output: [{ type: "text", text: "armed" }] };
                 },
             })],
         });
@@ -97,7 +97,7 @@ module.exports = defineExtension({
                 parameters: Type.Object({}),
                 execute: async () => {
                     await Promise.all([Infinity, NaN, -1, 1e300].map((delay) => new Promise((resolve) => setTimeout(resolve, delay))));
-                    return { content: [{ type: "text", text: "fired" }] };
+                    return { output: [{ type: "text", text: "fired" }] };
                 },
             })],
         });
@@ -180,7 +180,7 @@ module.exports = defineExtension({
                 parameters: { type: "object", properties: { who: { type: "string" } }, required: ["who"] },
                 execute: async (args, api, context) => {
                     const note = await api.env.readTextFile("/note.txt", context);
-                    return { content: [{ type: "text", text: `Hello, ${args.who}! ${note.ok ? note.value : ""}` }] };
+                    return { output: [{ type: "text", text: `Hello, ${args.who}! ${note.ok ? note.value : ""}` }] };
                 },
             })],
         });

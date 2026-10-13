@@ -117,7 +117,7 @@ private final class SpawnedProcess: @unchecked Sendable {
         read(stderrPipe[0], as: .stderr, output: output)
         DispatchQueue.global().async { [self] in
             var status: Int32 = 0
-            while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+            while waitpid(self.pid, &status, 0) == -1 && errno == EINTR {}
             let code: Int
             if status & 0x7f == 0 {
                 code = Int((status >> 8) & 0xff)

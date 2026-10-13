@@ -44,6 +44,8 @@ export declare class JsonlStorage implements Storage {
         readonly owner?: TaskId;
         readonly background: boolean;
         readonly abortRequested: boolean;
+        readonly abortReason?: "restart";
+        readonly abandonOnRestart?: true;
         readonly startedAt?: number;
         readonly endedAt?: number;
     } & ({
@@ -84,6 +86,8 @@ export declare class JsonlStorage implements Storage {
         readonly owner?: TaskId;
         readonly background: boolean;
         readonly abortRequested: boolean;
+        readonly abortReason?: "restart";
+        readonly abandonOnRestart?: true;
         readonly startedAt?: number;
         readonly endedAt?: number;
     } & ({

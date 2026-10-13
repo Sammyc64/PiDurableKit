@@ -141,7 +141,7 @@ import Testing
         let timing = Extension("timing") {
             Wrap.tool("get_weather") { call, _, next in
                 var result = try await next(["city": .string("Wrapped \(call.arguments["city"]?.stringValue ?? "")")])
-                result.content = [.text("[wrapped] " + (result.content?.compactMap(\.text).joined() ?? ""))]
+                result.output = [.text("[wrapped] " + (result.output?.compactMap(\.text).joined() ?? ""))]
                 return result
             }
         }

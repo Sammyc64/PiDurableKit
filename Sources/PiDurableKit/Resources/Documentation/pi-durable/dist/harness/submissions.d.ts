@@ -19,10 +19,13 @@ export declare class Submissions {
 }
 /**
  * Admit a submission inside a commit (spec §6); `Conversation.submit()` and conversation-owned compactions share it. A
- * known request ID returns its existing submission without writing. A busy conversation queues it in `pi.inbox`, or
- * rejects `whenBusy: "reject"` input with `ConversationBusy`. An idle conversation with queued items queues it behind
- * them and runs a final boundary. Otherwise idle input places a user entry and starts a run, and an idle write appends
- * its entry and settles `done`, or `stale` when its head reaches before the active range.
+ * known request ID returns its existing submission without writing. A display-only write (only `kind` and `data`) is
+ * appended and settled `done` at once, busy or not, as it changes nothing the model sees; only behind a queued reset it
+ * queues, so it lands after the reset instead of before it in the context the reset ends. A busy conversation queues anything else in
+ * `pi.inbox`, or rejects `whenBusy: "reject"` input with `ConversationBusy`. An idle conversation with queued items
+ * queues it behind them and runs a final boundary. Otherwise idle input places its entry (`pi.user`, or the input's
+ * own) and starts a run, and an idle write appends its entry and settles `done`, or `stale` when its head reaches
+ * before the active range.
  */
 export declare function admitSubmission(tx: Tx, conversationId: ConversationId, draft: SubmissionDraft, now: number, queueModes: QueueModes): Promise<SubmissionId>;
 export {};

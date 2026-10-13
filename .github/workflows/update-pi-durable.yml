@@ -62,7 +62,7 @@ jobs:
           title: Update pi-durable to ${{ steps.update.outputs.version }}
           draft: ${{ steps.test.outcome != 'success' || steps.test-ios.outcome != 'success' }}
           body: |
-            Updates the bundled `@earendil-works/pi-durable` from ${{ steps.update.outputs.previous }} to ${{ steps.update.outputs.version }}, with the `pi-ai` and `chord` releases it depends on, and rebuilds `pi-durable.js`.
+            Updates the bundled `@earendil-works/pi-durable` from ${{ steps.update.outputs.previous }} to ${{ steps.update.outputs.version }}, with the `pi-ai`, `chord`, and `pi-codemode` releases it depends on, and rebuilds `pi-durable.js` and `quickjs.wasm`.
 
             - macOS tests: **${{ steps.test.outcome }}**
             - iOS Simulator tests: **${{ steps.test-ios.outcome }}**

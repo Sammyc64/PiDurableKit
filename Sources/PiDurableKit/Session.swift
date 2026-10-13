@@ -62,15 +62,22 @@ public final class Session: Sendable {
     ///   - storage: Where to keep records and documents.
     ///   - runtime: The JavaScript runtime to run in.
     ///   - clock: The session clock for task times, for tests; defaults to the system clock.
-    public static func open(_ storage: Storage = .memory, runtime: Runtime = .shared, clock: (@Sendable () -> Date)? = nil)
-        async throws -> Session
-    {
+    ///   - documentRetention: How long a loaded document that nothing observes stays in memory; see
+    ///     ``Settings/documentRetention``.
+    public static func open(
+        _ storage: Storage = .memory, runtime: Runtime = .shared, clock: (@Sendable () -> Date)? = nil,
+        documentRetention: Duration? = nil
+    ) async throws -> Session {
         let engine = runtime.engine
         let id = await engine.makeObjectID()
         engine.host.registerHarness(id, extensions: [], callbacks: HarnessCallbacks(clock: clock))
         do {
             try await engine.perform(
-                "session.open", ["id": id, "storage": try storage.specification(engine.host), "clock": clock != nil])
+                "session.open",
+                [
+                    "id": id, "storage": try storage.specification(engine.host), "clock": clock != nil,
+                    "documentRetentionMs": documentRetention?.milliseconds,
+                ])
         } catch {
             engine.host.removeHarness(id)
             throw error
@@ -156,9 +163,14 @@ public final class Session: Sendable {
         engine.stream("harness.commits", ["harness": id])
     }
 
-    /// Returns when the session starts closing (pi-durable `subscribeClose`).
+    /// Returns when the session starts closing (pi-durable `subscribeClose`), also when a storage failure closes it.
     public func closing() async throws {
         for try await _ in engine.stream("harness.closeEvents", ["harness": id], of: Bool.self) { return }
+    }
+
+    /// Returns once the session has closed, storage included, and why (pi-durable `Session.closed`).
+    public func closed() async throws -> SessionEnd {
+        try await sessionEnd(engine: engine, id: id)
     }
 
     /// Settles admitted commits and closes the storage.
@@ -169,10 +181,34 @@ public final class Session: Sendable {
 }
 
 extension Harness {
-    /// Returns when the harness starts closing (pi-durable `subscribeClose`), for example to stop work that uses it.
+    /// Returns when the harness starts closing (pi-durable `subscribeClose`), for example to stop work that uses it;
+    /// also when a storage failure closes it.
     public func closing() async throws {
         for try await _ in engine.stream("harness.closeEvents", ["harness": id], of: Bool.self) { return }
     }
+
+    /// Returns once the harness has closed, storage included, and why (pi-durable `Session.closed`): after
+    /// ``close()``, or after a storage call failed, which closes the harness by itself. Reopen a failed harness; it
+    /// recovers from what was committed.
+    public func closed() async throws -> SessionEnd {
+        try await sessionEnd(engine: engine, id: id)
+    }
+}
+
+/// Why a session or harness ended (pi-durable `SessionEnd`).
+public enum SessionEnd: Sendable, Hashable {
+    /// ``Harness/close()`` or ``Session/close()``.
+    case closed
+    /// A storage call failed, which fails the session and closes it; the message of that error.
+    case failed(String)
+}
+
+private func sessionEnd(engine: Engine, id: Int) async throws -> SessionEnd {
+    for try await end in engine.stream("harness.closed", ["harness": id], of: JSONValue.self) {
+        if end["reason"]?.stringValue == "failed" { return .failed(end["error"]?["message"]?.stringValue ?? "") }
+        return .closed
+    }
+    throw CancellationError()
 }
 
 // MARK: Runtime utilities
@@ -214,17 +250,20 @@ extension Runtime {
     /// - Parameters:
     ///   - shell: Program and flag that run a POSIX shell script; default `["sh", "-c"]`.
     ///   - symlinks: Whether the shell's `ln -s` creates symbolic links; default `true`.
+    ///   - listFiles: Whether to check ``ExecutionEnv/listFiles(_:options:)``, which every PiDurableKit environment
+    ///     implements; default `true`.
     ///   - only: Run only the cases whose names contain one of these strings.
     ///   - makeEnvironment: A fresh environment.
     public func runEnvironmentConformance(
-        shell: [String]? = nil, symlinks: Bool? = nil, only: [String]? = nil,
+        shell: [String]? = nil, symlinks: Bool? = nil, listFiles: Bool = true, only: [String]? = nil,
         _ makeEnvironment: @escaping @Sendable () async throws -> ExecutionEnvironment
     ) async throws -> [ConformanceResult] {
         let router = engine.host
         let factory = router.registerConformanceFactory { try await makeEnvironment().specification(router) }
         defer { router.removeConformanceFactory(factory) }
         return try await results(engine.stream(
-            "conformance.env", ["factory": factory, "shell": shell, "symlinks": symlinks, "only": only], of: JSONValue.self))
+            "conformance.env", ["factory": factory, "shell": shell, "symlinks": symlinks, "listFiles": listFiles, "only": only],
+            of: JSONValue.self))
     }
 
     private func results(_ stream: AsyncThrowingStream<JSONValue, Error>) async throws -> [ConformanceResult] {

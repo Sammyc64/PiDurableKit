@@ -152,7 +152,7 @@ export interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver
      * Commit on the Session line after rereading the task. Rejects when the task is terminal, the invocation ended, the
      * Harness is closing, or, in a run invocation, the task carries an abort mark. A returned state replaces the task's
      * state in the same commit; returning nothing leaves it unchanged. `tx.createTask()` defaults to the task's
-     * conversation.
+     * conversation. Inside the callback read only through `tx`: `snapshot()`, `documentState()`, `watchDoc()`, `getTask()`, and the other Session and runtime reads may queue on the line the callback holds, and then never resolve.
      */
     commit(change: (tx: Tx, current: RunningTask<I, S, R>) => NextTaskState<S, R> | undefined | Promise<NextTaskState<S, R> | undefined>, context: Context): Promise<void>;
     /** Read a durable memo of this task. */
@@ -163,6 +163,16 @@ export interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver
     getTask<T>(id: TaskId<T>, context: Context): Promise<TaskRecord<JsonValue, JsonValue, T> | undefined>;
     /** Resolve with the task's terminal receipt; rejects when the invocation ends. */
     waitForTask<T>(id: TaskId<T>, context: Context): Promise<SettledTask<T>>;
+    /**
+     * Abort a task this task owns, as `Harness.abortTask()` does, and resolve once it is terminal. Rejects for a task
+     * another owns; resolves at once for a terminal one.
+     */
+    abortOwned(id: TaskId, context: Context): Promise<void>;
+    /**
+     * Live tasks this task owns directly, in ID order: also those an earlier invocation created, before a restart. Tasks
+     * in conversations it owns are not included. Copies of the committed records.
+     */
+    ownedTasks(context: Context): Promise<TaskRecord<JsonValue, JsonValue, JsonValue>[]>;
     /** Outcomes of terminal tasks, in order; rejects when one is missing or not terminal. Used after a wait. */
     outcomes<T>(ids: readonly TaskId<T>[], context: Context): Promise<TaskOutcome<T>[]>;
     /**
@@ -236,6 +246,12 @@ export type TaskOptions = {
     readonly conversationId?: ConversationId;
     /** Conversation-owned tasks only: excluded from ordinary idle waits, conversation aborts, and cascades. */
     readonly background?: boolean;
+    /**
+     * Its creator awaits it only in memory and does not resume after a restart, so it is pointless once the Harness that
+     * created it is gone. When scheduling starts in a later Harness, the task, if still live, is abort-marked with reason
+     * `restart`, and the mark cascades to its ordinary owned work, before any of it runs again.
+     */
+    readonly abandonOnRestart?: boolean;
 };
 /** Ownership selected explicitly whenever a conversation is created. */
 export type ConversationOwnership = {
@@ -470,6 +486,14 @@ type TaskRecordBase<I, R> = {
     readonly background: boolean;
     /** Durable abort mark checked before run-mode progress is committed. */
     readonly abortRequested: boolean;
+    /**
+     * Why the mark was set when not by an abort request: `restart` for a task abandoned after a restart
+     * (`TaskOptions.abandonOnRestart`) or below one. Such a task waits for its definition instead of becoming `orphaned`.
+     * A later abort request clears it.
+     */
+    readonly abortReason?: "restart";
+    /** Set from `TaskOptions.abandonOnRestart`. Immutable. */
+    readonly abandonOnRestart?: true;
     /**
      * Wall-clock milliseconds of the first change to `running`, stamped by the Session. Kept through waits and recovery,
      * so the span to `endedAt` includes them. Absent before the task first runs, and on records written by earlier
@@ -750,6 +774,11 @@ export type WatchEnd = {
 } | {
     readonly reason: "listener_error";
     readonly error: Error;
+}
+/** The Session failed; `error` is what failed it, usually a storage error (see `SessionFailed`). */
+ | {
+    readonly reason: "session_failed";
+    readonly error: unknown;
 };
 /** Serialized exact-frame observation of an immutable value with bounded pending delivery. */
 export interface WatchHandle<T> {
@@ -774,15 +803,32 @@ export interface DocumentObserver {
     watchDoc<T extends JsonObject, I extends JsonValue>(token: ConversationDocFamilyToken<T, I>, conversationId: ConversationId, key: string, context: Context): Promise<DocumentWatch<T> | undefined>;
     watchDoc<T extends JsonObject, I extends JsonValue>(token: TaskDocFamilyToken<T, I>, taskId: TaskId, key: string, context: Context): Promise<DocumentWatch<T> | undefined>;
 }
+/** Why a Session ended: `close()`, or a failed Storage call, whose error it carries. */
+export type SessionEnd = {
+    readonly reason: "closed";
+} | {
+    readonly reason: "failed";
+    readonly error: unknown;
+};
 /** Owner of one mutation line, its records, and its tracked documents. */
 export interface Session extends DocumentObserver {
-    /** Run one atomic transaction on the Session mutation line. */
+    /**
+     * Run one atomic transaction on the Session mutation line. Inside the callback read only through `tx`: `snapshot()`, `documentState()`, `watchDoc()`, `getTask()`, and the other Session and runtime reads may queue on the line the callback holds, and then never resolve.
+     */
     commit<T>(change: (tx: Tx) => T | Promise<T>, context: Context): Promise<T>;
     /** Seal admission, settle admitted commits, then close storage. */
     close(context: Context): Promise<void>;
-    /** Observe complete commits synchronously after adoption. The listener must not throw, block, or call Session APIs. */
+    /**
+     * Settles once the Session has closed, Storage included: after `close()`, or after the first failed Storage call,
+     * which closes the Session itself. A failed Session is reopened from Storage; nothing else is left to clean up.
+     */
+    readonly closed: Promise<SessionEnd>;
+    /** Observe complete commits synchronously after adoption. The listener must not block or call Session APIs. */
     subscribeCommits(listener: (publication: CommitPublication, context: Context) => void): () => void;
-    /** Observe close synchronously when it begins. The listener must not throw, block, or call Session APIs. */
+    /**
+     * Observe close synchronously when it begins, also when a failed Storage call closes the Session. The listener must
+     * not block or call Session APIs.
+     */
     subscribeClose(listener: () => void): () => void;
     snapshot<T extends JsonObject>(token: SessionDocToken<T>, context: Context): Promise<Readonly<T> | undefined>;
     snapshot<T extends JsonObject>(token: ConversationDocToken<T>, conversationId: ConversationId, context: Context): Promise<Readonly<T> | undefined>;
@@ -806,13 +852,21 @@ export interface Session extends DocumentObserver {
  * ancestry, and transitions. Implementations enforce atomicity, global ID ownership,
  * immutable conversation/entry creation, document record consistency, and detached values;
  * Session serializes commits.
+ *
+ * An error a method throws is final: it fails the Session, which nothing retries, so retry transient failures inside
+ * the method. Two errors of a read fail only that read: a `StorageRequestError` for an invalid request (an unknown
+ * conversation, a foreign or malformed cursor, history a document does not keep), which must have no durable effect, and a
+ * rejection because its caller's context was aborted. Any error from `commit()` or `mintId()` is fatal.
  */
 export interface Storage {
     /**
      * Atomically persist one batch and return its sequence. Once resolved, later reads through this storage observe it.
      */
     commit(writes: readonly StorageWrite[], context: Context): Promise<Seq>;
-    /** Return a fresh branded candidate from the Session-global numeric ID namespace. */
+    /**
+     * Return a fresh branded candidate from the Session-global numeric ID namespace, greater than every ID minted or stored
+     * before, also across reopen: scans order by ID as creation order, and the Harness relies on it.
+     */
     mintId<I extends Id<string>>(): Promise<I>;
     /** Look up one conversation by exact ID. */
     conversation(id: ConversationId, context: Context): Promise<ConversationRecord | undefined>;

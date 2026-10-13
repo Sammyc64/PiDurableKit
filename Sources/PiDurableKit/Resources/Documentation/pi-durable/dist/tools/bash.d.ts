@@ -9,8 +9,16 @@ declare const powershellSchema: Type.TObject<{
     command: Type.TString;
     timeout: Type.TOptional<Type.TNumber>;
 }>;
+/** What a program that calls `bash` or `powershell` receives. */
+declare const shellStructuredOutputSchema: Type.TObject<{
+    output: Type.TString;
+    truncated: Type.TBoolean;
+    fullOutputPath: Type.TOptional<Type.TString>;
+    exitCode: Type.TNumber;
+}>;
 export type BashToolInput = Static<typeof bashSchema>;
 export type PowerShellToolInput = Static<typeof powershellSchema>;
+export type ShellStructuredOutput = Static<typeof shellStructuredOutputSchema>;
 /** A command about to run, which `prepare` may change: the script, its working directory and environment. */
 export interface BashExecution {
     command: string;
@@ -34,8 +42,8 @@ export interface PowerShellToolOptions {
  * Runs a command through the environment's shell. Its output streams to `api.output()`, where the Harness keeps the
  * tail within the default limits; the result content is that retained output. The retained window goes to the
  * environment, which may omit output outside it and report how much it omitted, so dropped counts stay exact. Output
- * beyond the limits is spilled to a file whose path is reported as a diagnostic. A nonzero exit or timeout throws, which
- * makes an error result that still carries the output and diagnostics.
+ * beyond the limits is spilled to a file whose path is reported as a diagnostic. A nonzero exit is an error result with
+ * the exit code; a timeout throws, which makes an error result that still carries the output and diagnostics.
  */
 export declare function createBashTool(options?: BashToolOptions): ToolRegistration<typeof bashSchema>;
 /**

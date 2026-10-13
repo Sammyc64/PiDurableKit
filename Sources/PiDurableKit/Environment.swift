@@ -149,6 +149,48 @@ public struct ShellOutput: Sendable, Hashable {
     public let skipped: OutputSkip?
 }
 
+/// What ``ExecutionEnv/listFiles(_:options:)`` lists (pi-durable `ListFilesOptions`).
+public struct ListFilesOptions: Encodable, Sendable, Hashable {
+    /// Include names starting with `.`; default `true`.
+    public var hidden: Bool?
+    /// Inside a git work tree, skip what git ignores; default `true`.
+    public var gitignore: Bool?
+    /// Names of entries to skip with everything below them, such as `node_modules`.
+    public var exclude: [String]?
+    /// Most entries to list; default 50,000.
+    public var maxEntries: Int?
+    /// Most bytes of the listing, each entry's UTF-8 path plus two; default 4 MiB.
+    public var maxBytes: Int?
+    /// Time after which the listing stops, in milliseconds; default 10,000.
+    public var timeoutMs: Int?
+
+    public init(
+        hidden: Bool? = nil, gitignore: Bool? = nil, exclude: [String]? = nil, maxEntries: Int? = nil, maxBytes: Int? = nil,
+        timeoutMs: Int? = nil
+    ) {
+        self.hidden = hidden
+        self.gitignore = gitignore
+        self.exclude = exclude
+        self.maxEntries = maxEntries
+        self.maxBytes = maxBytes
+        self.timeoutMs = timeoutMs
+    }
+}
+
+/// A tree listing (pi-durable `FileListing`).
+public struct FileListing: Decodable, Sendable, Hashable {
+    public struct Entry: Decodable, Sendable, Hashable {
+        /// Relative to the listed directory, with `/` separators.
+        public let path: String
+        /// A symbolic link is listed as such and not followed.
+        public let kind: FileKind
+    }
+
+    public let entries: [Entry]
+    /// A bound ended the listing early.
+    public let truncated: Bool
+}
+
 /// The outcome of a command (pi-durable `ShellExecResult`).
 public struct ShellResult: Decodable, Sendable, Hashable {
     public let exitCode: Int
@@ -271,6 +313,13 @@ public final class ExecutionEnv: Sendable {
     /// Metadata of `path`, without following a final symbolic link.
     public func fileInfo(_ path: String) async throws -> FileInfo { try await call("env.fileInfo", ["path": path]) }
     public func listDirectory(_ path: String) async throws -> [FileInfo] { try await call("env.listDir", ["path": path]) }
+
+    /// The files, directories, and symbolic links below a directory, at any depth, for indexes such as file
+    /// completion (pi-durable `listFiles`): depth first, parents before their entries, siblings in name order. `.git` is
+    /// never listed, and inside a git work tree what its ignore files ignore is skipped.
+    public func listFiles(_ path: String = ".", options: ListFilesOptions = ListFilesOptions()) async throws -> FileListing {
+        try await call("env.listFiles", ["path": path, "options": options])
+    }
 
     // MARK: Reading
 

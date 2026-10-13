@@ -5,8 +5,9 @@ Install pi-durable extensions written in JavaScript, unchanged.
 ## Overview
 
 ``Extension/init(_:javaScript:sourceURL:)`` evaluates a CommonJS module whose `module.exports` is a pi-durable
-extension, and installs it like any other. The module can `require` `@earendil-works/pi-durable` (and its `/tools` and
-`/env` entry points), `@earendil-works/pi-ai`, and `@earendil-works/chord/context`.
+extension, and installs it like any other. The module can `require` `@earendil-works/pi-durable` (and its `/tools`,
+`/env`, `/tool-search`, and `/codemode` entry points), `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`,
+and `@earendil-works/chord/context`.
 
 ```js
 const { defineExtension, defineTool } = require("@earendil-works/pi-durable");
@@ -15,7 +16,7 @@ module.exports = defineExtension({
   name: "dice",
   tools: [defineTool({
     name: "roll", description: "Roll a die", parameters: Type.Object({ sides: Type.Number() }),
-    execute: async (args) => ({ content: [{ type: "text", text: String(1 + Math.floor(Math.random() * args.sides)) }] }),
+    execute: async (args) => ({ output: [{ type: "text", text: String(1 + Math.floor(Math.random() * args.sides)) }] }),
   })],
 });
 ```

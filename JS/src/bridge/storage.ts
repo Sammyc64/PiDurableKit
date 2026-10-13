@@ -2,7 +2,7 @@
 // Harness, and pi-durable's conformance suites run against Swift implementations.
 import type { Context } from "@earendil-works/chord";
 import { apply, type Op } from "@earendil-works/chord/delta";
-import { createRegistry, createSession, MemoryStorage, type Storage } from "@earendil-works/pi-durable";
+import { createRegistry, createSession, MemoryStorage, type Storage, StorageRequestError } from "@earendil-works/pi-durable";
 import { JsonlStorage } from "@earendil-works/pi-durable/storage/jsonl";
 import { SqliteStorage } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -11,7 +11,7 @@ import type { StorageConformanceAssertions } from "@earendil-works/pi-durable/te
 import { type Args, contextOf, emit, finish, host, hostSync, openStream, register, serializeError } from "./core.ts";
 import { environmentOf, SandboxEnv } from "./env.ts";
 import { HostSqliteDatabase } from "./sqlite.ts";
-import { type HarnessState, harnessState, harnesses } from "./state.ts";
+import { endings, type HarnessState, harnessState, harnesses } from "./state.ts";
 
 /** pi-durable's `Storage` implemented in Swift, by its registration number. Records cross as JSON. */
 class HostStorage implements Storage {
@@ -21,8 +21,14 @@ class HostStorage implements Storage {
 		this.#storage = storage;
 	}
 
-	#call<T>(operation: string, args: Args, context?: Context): Promise<T> {
-		return host<T>("storage.custom", { storage: this.#storage, operation, ...args }, context);
+	async #call<T>(operation: string, args: Args, context?: Context): Promise<T> {
+		try {
+			return await host<T>("storage.custom", { storage: this.#storage, operation, ...args }, context);
+		} catch (error) {
+			// Swift's `PiDurableError.storageRequestError` fails only this read, as pi-durable's `StorageRequestError` does.
+			if ((error as { code?: string }).code === "storage_request") throw new StorageRequestError((error as Error).message);
+			throw error;
+		}
 	}
 
 	async #optional<T>(operation: string, args: Args, context?: Context): Promise<T | undefined> {
@@ -175,7 +181,13 @@ register({
 	/** A plain pi-durable Session (`createSession`) without a Harness: commits, documents, and commit publications. */
 	"session.open": async (args, context) => {
 		const storage = await openStorage(args.storage, context);
-		const session = createSession(storage, args.clock ? { now: () => hostSync<number>("harness.now", { harness: args.id }) } : {});
+		const session = createSession(storage, {
+			...(args.clock ? { now: () => hostSync<number>("harness.now", { harness: args.id }) } : {}),
+			...(args.documentRetentionMs == null
+				? {}
+				: { documentRetentionMs: args.documentRetentionMs >= 3.15e16 ? Number.POSITIVE_INFINITY : args.documentRetentionMs }),
+		});
+		endings.set(args.id, session.closed);
 		harnesses.set(args.id, {
 			id: args.id,
 			harness: session as never,
@@ -191,6 +203,17 @@ register({
 			finish(stream);
 		});
 		openStream(stream, unsubscribe);
+	},
+	/** Emits `{ reason, error? }` once the session or harness has closed, Storage included (`Session.closed`). */
+	"harness.closed": (args) => {
+		const stream = args.stream as number;
+		openStream(stream, () => undefined);
+		const ending = endings.get(args.harness);
+		if (ending === undefined) throw new Error("The harness is closed");
+		void ending.then((end) => {
+			emit(stream, end.reason === "failed" ? { reason: "failed", error: serializeError(end.error) } : { reason: "closed" });
+			finish(stream);
+		});
 	},
 	/** Applies Chord operations to a JSON value, as storage materializes documents. */
 	"chord.apply": (args) => apply(args.value ?? undefined, args.ops as Op[]) ?? null,
@@ -232,6 +255,7 @@ register({
 			},
 			...(args.shell == null ? {} : { shell: args.shell }),
 			...(args.symlinks == null ? {} : { symlinks: args.symlinks }),
+			...(args.listFiles == null ? {} : { listFiles: args.listFiles }),
 		});
 		void runCases(stream, cases, args.only ?? null).then(
 			() => finish(stream),

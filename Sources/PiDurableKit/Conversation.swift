@@ -52,25 +52,20 @@ public struct Conversation: Sendable, Identifiable, Hashable {
     ///   - whenBusy: What to do when the conversation is busy.
     ///   - requestId: A deduplication key: submitting again with the same key returns the existing submission, so a
     ///     retry after a crash never submits twice.
+    ///   - entry: The entry the input is placed as instead of `pi.user`, such as a chat message carrying its author.
     @discardableResult
-    public func submit(_ text: String, whenBusy: WhenBusy = .followUp, requestId: String? = nil) async throws -> Submission {
-        try await submit([.text(text)], whenBusy: whenBusy, requestId: requestId)
+    public func submit(
+        _ text: String, whenBusy: WhenBusy = .followUp, requestId: String? = nil, entry: InputEntry? = nil
+    ) async throws -> Submission {
+        try await submit([.text(text)], whenBusy: whenBusy, requestId: requestId, entry: entry)
     }
 
     /// Durably admits user input made of text and images.
     @discardableResult
-    public func submit(_ content: [ContentBlock], whenBusy: WhenBusy = .followUp, requestId: String? = nil) async throws
-        -> Submission
-    {
-        let content: JSONValue =
-            if content.count == 1, let text = content[0].text { .string(text) } else { try JSONValue(encoding: content) }
-        let submission: JSONValue = [
-            "type": "input",
-            "content": content,
-            "whenBusy": .string(whenBusy.rawValue),
-            "requestId": requestId.map(JSONValue.string) ?? .null,
-        ]
-        return try await admit(submission)
+    public func submit(
+        _ content: [ContentBlock], whenBusy: WhenBusy = .followUp, requestId: String? = nil, entry: InputEntry? = nil
+    ) async throws -> Submission {
+        try await admit(try InputEntry.submission(content, whenBusy: whenBusy, requestId: requestId, entry: entry))
     }
 
     /// Appends an entry without asking the model anything. While busy, it is placed at the next boundary.
@@ -286,7 +281,7 @@ public struct Conversation: Sendable, Identifiable, Hashable {
 
     // MARK: Transactions
 
-    /// Runs `body` in one atomic commit; ``Transaction/createTask(_:input:in:ownedBy:background:)`` defaults to this
+    /// Runs `body` in one atomic commit; ``Transaction/createTask(_:input:in:ownedBy:background:abandonOnRestart:)`` defaults to this
     /// conversation.
     @discardableResult
     public func commit<T: Sendable>(_ body: @escaping @Sendable (Transaction) async throws -> T) async throws -> T {
@@ -314,4 +309,38 @@ public struct ConversationChange: Decodable, Sendable {
     public let view: ConversationView
     /// Chord operations from the previous view to this one; empty for the first view.
     public let ops: [JSONValue]
+}
+
+/// The entry an input is placed as instead of `pi.user` (pi-durable `InputEntry`): an application kind, and data the
+/// transcript shows, such as its author. Its model message is still the input's user message.
+///
+/// ```swift
+/// try await conversation.submit("Hi!", entry: InputEntry(kind: "app.chat", data: ["author": "Ada"]))
+/// ```
+public struct InputEntry: Codable, Sendable, Hashable {
+    /// The entry kind; must not start with `pi.`.
+    public var kind: EntryKind
+    public var data: JSONValue?
+
+    public init(kind: EntryKind, data: JSONValue? = nil) {
+        self.kind = kind
+        self.data = data
+    }
+
+    /// An entry of a typed kind.
+    public init<Data>(_ type: EntryType<Data>, _ data: Data) throws {
+        self.init(kind: type.kind, data: try JSONValue(encoding: data))
+    }
+
+    /// The JSON of an input submission.
+    static func submission(
+        _ content: [ContentBlock], whenBusy: Conversation.WhenBusy, requestId: String?, entry: InputEntry?
+    ) throws -> JSONValue {
+        let content: JSONValue =
+            if content.count == 1, let text = content[0].text { .string(text) } else { try JSONValue(encoding: content) }
+        var submission: JSONObject = ["type": "input", "content": content, "whenBusy": .string(whenBusy.rawValue)]
+        if let requestId { submission["requestId"] = .string(requestId) }
+        if let entry { submission["entry"] = try JSONValue(encoding: entry) }
+        return .object(submission)
+    }
 }

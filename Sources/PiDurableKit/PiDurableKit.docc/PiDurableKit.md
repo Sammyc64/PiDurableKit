@@ -34,6 +34,7 @@ if case .done(_, let answer?) = settled.status {
 - ``Submission``
 - ``Storage``
 - ``Session``
+- ``SessionEnd``
 - ``CustomStorage``
 
 ### Bundled pi-durable
@@ -58,8 +59,12 @@ if case .done(_, let answer?) = settled.status {
 - ``PromptSection``
 - ``Hook``
 - ``Wrap``
+- ``NestedToolResult``
 - ``ToolDefinition``
 - ``BuiltinTool``
+- ``CodemodeOptions``
+- ``ImageProcessor``
+- ``NativeImageProcessor``
 - ``RegistrySnapshot``
 - <doc:JavaScriptExtensions>
 
@@ -75,6 +80,7 @@ if case .done(_, let answer?) = settled.status {
 - ``ExecutionEnv``
 - ``CustomExecutionEnvironment``
 - ``FileInfo``
+- ``FileListing``
 - ``ShellCommand``
 
 ### State
@@ -83,6 +89,7 @@ if case .done(_, let answer?) = settled.status {
 - ``Document``
 - ``EntryType``
 - ``EntryDraft``
+- ``InputEntry``
 - ``ContextEdit``
 - ``ContextView``
 - ``Transaction``

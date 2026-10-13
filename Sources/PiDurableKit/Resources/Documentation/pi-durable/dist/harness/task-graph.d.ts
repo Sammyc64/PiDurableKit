@@ -1,5 +1,5 @@
 import { type AttachedReplicatedState, type Context, type JsonValue } from "@earendil-works/chord";
-import type { SessionImpl } from "../session/session.ts";
+import { type SessionImpl } from "../session/session.ts";
 import type { ConversationId, JoinPolicy, Storage, TaskId, TaskOutcome, WatchHandle } from "../types.ts";
 /** A live task's durable status without its checkpoint and outcome payloads (spec §9.5). */
 export type TaskGraphState = {

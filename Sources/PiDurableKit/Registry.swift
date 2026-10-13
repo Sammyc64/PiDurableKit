@@ -13,6 +13,12 @@ public struct RegistrySnapshot: Decodable, Sendable, Hashable {
             public let parameters: JSONValue
             public let replay: Tool.Replay
             public let executionMode: Settings.ToolExecution?
+            /// The JSON schema of the tool's structured output.
+            public let structuredOutputSchema: JSONValue?
+            /// Who may call the tool.
+            public let callers: [Tool.Caller]
+            /// Whether the tool is kept from the model until loaded.
+            public let deferred: Bool
         }
 
         /// One wrap: the tool or section it decorates.

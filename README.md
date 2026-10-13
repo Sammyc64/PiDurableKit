@@ -63,8 +63,15 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 | an extension written in JavaScript | `Extension(name, javaScript: source)` |
 | `defineTask`, `TaskRuntime` | `TaskType`, `Phase`, `TaskRun` |
 | `harness.commit()`, `conversation.commit()`, `Tx` | `harness.commit { tx in … }`, `conversation.commit { tx in … }`, `Transaction` |
-| `ToolExecutionApi` (`commit`, `conversation`, `memo`, `env`, `registry`, `outputWindow`, …) | `ToolCallContext` (`environment()`, `registry()`, `outputWindow`, `output(_:skipped:)`, …) |
-| `TaskRuntime` `env()`, `settings`, `registry` | `run.environment()`, `run.settings()`, `run.registry()` |
+| `ToolExecutionApi` (`commit`, `conversation`, `memo`, `env`, `registry`, `outputWindow`, `retainedOutput`, …) | `ToolCallContext` (`environment()`, `registry()`, `outputWindow`, `output(_:skipped:)`, `retainedOutput()`, …) |
+| `api.executeTool(name, args, { key, progress })` → `NestedToolExecutionResult` | `call.executeTool(_:arguments:key:progress:)` → `NestedToolResult` |
+| `ToolExecutionResult` `output`, `structuredOutput`; `structuredOutputSchema` | `ToolResult(output:structuredOutput:)`, `ToolResult.structured(_:)`; `tool.returningStructuredOutput(_:)` |
+| `ToolRegistration.callers`, `deferred`; `pi.agent` `modelTools` | `tool.callable(by:)`, `tool.deferringUntilLoaded()`; `AgentChange(modelTools:)`, `Agent.callable`, `Agent.deferred` |
+| `@earendil-works/pi-durable/tool-search`, `/codemode` | `Extension.toolSearch()`, `Extension.codemode(_:)` |
+| `createCodingTools({ images })`, `/images` (Photon) | `Extension.codingTools(images: .native)` (ImageIO), or your `ImageProcessor` |
+| `TaskRuntime` `env()`, `settings`, `registry`, `ownedTasks()`, `abortOwned()` | `run.environment()`, `run.settings()`, `run.registry()`, `run.ownedTasks()`, `run.abortOwned(_:)` |
+| `TaskOptions.abandonOnRestart` | `tx.createTask(…, abandonOnRestart: true)`, `call.createTask(…, abandonOnRestart:)` |
+| `submit({ type: "input", content, entry: { kind, data } })` | `conversation.submit("…", entry: InputEntry(kind:data:))` |
 | `registry.snapshot()`, `resolveSettings()`, `DEFAULT_*_POLICY` | `harness.registry()`, `harness.resolvedSettings()`, `Runtime.defaultSettings()` |
 | `conversation.watch()` / `viewState()` | `conversation.changes()` / `conversation.views()`, `conversation.view()` |
 | `watchEvents(harness, id)` → `snapshot`, `start(listener)` | `harness.watchEvents(id)` → `snapshot`, `for try await events in stream` |
@@ -79,7 +86,9 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 | `ExecutionEnv` (`readTextFile`, `openBinaryReader`, `exec`, `watch`, …) | `ExecutionEnv` from `harness.environment(for:)` or a call's `environment()` |
 | a custom `ExecutionEnv` | `CustomExecutionEnvironment` |
 | `createReadTool()`, `createBashTool({ commandPrefix, prepare })`, `createPowerShellTool()` | `Extension.builtinTools(name:_:)` with `.read`, `.write`, `.edit`, `.bash(commandPrefix:prepare:)`, `.powerShell(…)` |
-| `harness.subscribeCommits()`, `subscribeClose()` | `harness.commits()`, `harness.closing()` |
+| `harness.subscribeCommits()`, `subscribeClose()`, `closed` | `harness.commits()`, `harness.closing()`, `harness.closed()` → `SessionEnd` |
+| `ExecutionEnv.listFiles()` | `env.listFiles(_:options:)` |
+| `HarnessSettings.documentRetentionMs` | `Settings(documentRetention:)`, `Session.open(documentRetention:)` |
 | `createSession(storage)` | `Session.open(_:)` |
 | a custom `Storage` | `Storage.custom(_:)` with your `CustomStorage` |
 | `registerStorageConformance`, `registerEnvConformance` | `Runtime.runStorageConformance(_:)`, `Runtime.runEnvironmentConformance(_:)` |
@@ -87,7 +96,7 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 | `SqliteStorage` over a `SqliteDatabase` facade | `Storage.sqlite(database:)` with your `SQLiteDatabase` |
 | pi-ai `models.completeSimple()`, `streamSimple()` | `models.complete(_:context:options:)`, `models.stream(_:context:options:)` |
 | `ROOT_CONVERSATION_ID`, `INSTRUCTIONS_KEY` | `ConversationID.root`, `PromptSection.instructionsKey` |
-| `ReadAfterWrite`, `StorageRejected`, `ConversationBusy`, `FileError`, `ExecutionError`, `Jsonl*Error` | `PiDurableError.readAfterWrite`, `.storageRejected`, `.conversationBusy(id)`, `.file(code:message:path:)`, `.execution(code:message:spillPath:)`, `.jsonlCorrupted`, `.jsonlPoisoned` |
+| `ReadAfterWrite`, `SessionFailed`, `StorageRequestError`, `ConversationBusy`, `FileError`, `ExecutionError`, `Jsonl*Error` | `PiDurableError.readAfterWrite`, `.sessionFailed(message:cause:)`, `.storageRequestError`, `.conversationBusy(id)`, `.file(code:message:path:)`, `.execution(code:message:spillPath:)`, `.jsonlCorrupted`, `.jsonlPoisoned` |
 | `conversationCreated`, `init`, `now`, `onReport` | `onConversationCreated:`, `initialize:`, `clock:`, `onReport:` |
 | `JsonlStorage`, `models.refresh()`, `models.getAuth()` | `Storage.jsonl(at:)` / `.jsonl(in:directory:)`, `models.refresh()`, `models.isConfigured(_:)` |
 
@@ -143,15 +152,15 @@ module.exports = defineExtension({
   name: "dice",
   tools: [defineTool({
     name: "roll", description: "Roll a die", parameters: Type.Object({ sides: Type.Number() }),
-    execute: async (args) => ({ content: [{ type: "text", text: String(1 + Math.floor(Math.random() * args.sides)) }] }),
+    execute: async (args) => ({ output: [{ type: "text", text: String(1 + Math.floor(Math.random() * args.sides)) }] }),
   })],
 });
 """#
 try await harness.install(Extension("dice", javaScript: source))
 ```
 
-The module is CommonJS and can `require` `@earendil-works/pi-durable` (and `/tools`, `/env`), `@earendil-works/pi-ai`,
-and `@earendil-works/chord/context`. As in pi-durable, extension code is not sandboxed, so install only code you trust;
+The module is CommonJS and can `require` `@earendil-works/pi-durable` (and `/tools`, `/env`, `/tool-search`,
+`/codemode`), `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`, and `@earendil-works/chord/context`. As in pi-durable, extension code is not sandboxed, so install only code you trust;
 it cannot reach PiDurableKit's own bridge to storage. Like any extension, install it again after a restart before
 resuming (`Harness.open(…, resume: false)`, `install`, `resume()`) so its pending tool calls continue.
 
@@ -185,10 +194,38 @@ let subagent = Tool("subagent", description: "Delegate a task", parameters: .obj
 ```
 
 `ToolCallContext` also offers `memo` (values that survive a rerun), `agent()`, `document(_:)`, `createTask`,
-`waitForTask`, and `details`/`diagnostic`. `tools()` lists the tools the conversation is offered, with their schemas,
-and `callTool(_:arguments:)` runs one of them as part of the call, as the harness would run it (pi-durable's
-`api.agent().tools` and each tool's `execute`). Results can `addingTools(…)`, and tools can repair arguments
+`waitForTask`, and `details`/`diagnostic`. `tools()` lists the tools the conversation offers the model, with their
+schemas, and `callableTools()` those other tools can call. Results can `addingTools(…)`, and tools can repair arguments
 (`preparingArguments`) or bound their output (`limitingOutput`).
+
+### Nested calls and structured output
+
+A tool can call another tool as a durable nested call, its own `pi.tool` task owned by the call. Its result returns to
+the caller instead of the transcript, and a tool that declares a schema gives programs a value instead of text:
+
+```swift
+let forecast = Tool("forecast", description: "Forecast", parameters: .object(["city": .string()])) { (args: City, _) in
+    try ToolResult.structured(Forecast(city: args.city, celsius: 21))   // for programs; its JSON text for the model
+}.returningStructuredOutput(.object(["city": .string(), "celsius": .integer()]))
+
+let plan = Tool("plan", description: "Plan a trip", replay: .safe) { (call: ToolCallContext) in
+    async let oslo = call.executeTool("forecast", arguments: ["city": "Oslo"], key: "oslo")
+    async let rome = call.executeTool("forecast", arguments: ["city": "Rome"], key: "rome")
+    let forecasts = try await [oslo, rome].map { try $0.decode(as: Forecast.self) }
+    return "Warmest: \(forecasts.max { $0.celsius < $1.celsius }!.city)"
+}
+```
+
+Nested calls validate, run the tool hooks (`ToolCall.parent` names the caller), and show in `view.live.nestedTools` and
+in agent events (`ToolEventCall.parentCallId`). Keys let a replay-safe caller's rerun reattach to the calls it already
+made. `tool.callable(by: [.tools])` keeps a tool from the model; `deferringUntilLoaded()` keeps it from the model until
+loaded with `AgentChange(modelTools: .edit(add: […]))` or `Extension.toolSearch()`, the model's `tool_search`.
+
+`Extension.codemode()` adds pi-durable's durable code mode: a `codemode` tool whose JavaScript scripts call the
+conversation's tools (`await tools.forecast({ city: "Oslo" })`) as nested calls, in a QuickJS sandbox bundled as
+WebAssembly. A script survives a restart: it replays from a journal of the results it got and continues. Scripts run
+on the runtime's JavaScript thread, so one that computes without awaiting a tool holds up the runtime until its interrupt
+budget runs out.
 
 `harness.commit { tx in … }` and `conversation.commit { tx in … }` run any set of reads and writes atomically: create
 conversations and forks, append entries, create tasks, configure agents, and read or write documents. Throwing rolls
@@ -258,7 +295,7 @@ Hooks get a `HookContext` with `memo` and `document(_:)`; sections get `input.sh
 ```swift
 let summary = try await call.harness.models.complete(.anthropic("claude-haiku-4-5"), context: ModelContext(
     systemPrompt: "Summarize in one sentence.", messages: [.user(UserMessage(content: [.text(text)]))]))
-return ToolResult(content: [.text(summary.text)], usage: summary.usage)   // the spend counts in pi.usage
+return ToolResult(output: [.text(summary.text)], usage: summary.usage)   // the spend counts in pi.usage
 ```
 
 `models.stream(...)` yields text and thinking deltas, completed tool calls, and the final message.
@@ -267,9 +304,12 @@ return ToolResult(content: [.text(summary.text)], usage: summary.usage)   // the
 
 ```swift
 let harness = try await Harness.open(
-    .sqlite(at: url), models: models, extensions: [.codingTools()],
+    .sqlite(at: url), models: models, extensions: [.codingTools(images: .native)],
     environment: .directory(URL.documentsDirectory.appending(path: "Workspace")))
 ```
+
+`read` returns images too; `images: .native` orients, converts, and shrinks them to the model's limits with ImageIO
+(pi-durable's Photon processor, natively), and without it images within the byte limit pass through as they are.
 
 The agent sees the directory as `/` and cannot leave it; a conversation's `cwd` is a path inside it. There is no
 shell on iOS, so `bash` is not included. On macOS, `.directory(url, shell: true)` adds a shell (commands run in the
@@ -295,6 +335,7 @@ task phases, and sections reach the one built for their call:
 ```swift
 let env = try await harness.environment(for: conversation.id)!
 let files = try await env.listDirectory(".")
+let tree = try await env.listFiles(".", options: ListFilesOptions(exclude: ["node_modules"]))   // honors .gitignore
 try await env.write("notes", to: "notes.md")
 let result = try await env.run(.argv(["git", "status", "--porcelain"])) { chunk in print(chunk.stream, chunk.text) }
 for try await change in env.watch([WatchTarget("/", recursive: true)]) { reload(change) }
@@ -349,6 +390,8 @@ for try await events in stream {          // one batch per commit
 ## Busy conversations
 
 ```swift
+try await conversation.write(EntryDraft(kind: "app.note", data: "seen"))  // display-only: appended at once, even mid-run
+try await conversation.submit("Hi!", entry: InputEntry(kind: "app.chat", data: ["author": "Ada"]))  // input as your own entry
 try await conversation.submit("Also run the tests")                      // follow-up (default)
 try await conversation.submit("Use pnpm, not npm", whenBusy: .steer)    // joins the running work
 try await conversation.submit("Only if idle", whenBusy: .reject)        // throws .conversationBusy
@@ -369,6 +412,9 @@ let settled = try await harness.submission(submission.id)?.wait()
 ```
 
 Install the same extensions after a restart so pending tool calls can resume.
+
+A storage call that throws fails the harness, which closes itself: later calls throw `PiDurableError.sessionFailed`, and
+`harness.closed()` returns `.failed(message)`. Reopen it; reopening recovers from what was committed.
 
 ## Your own state
 
@@ -505,6 +551,8 @@ let root = try await harness.root(agent: AgentChange(model: faux.model))
 | pi-ai `CredentialStore` | `CredentialStore` (Keychain, memory, or yours) |
 | pi-durable `ExecutionEnv` (sandbox files) | POSIX file calls on the sandbox's real directory |
 | `Shell.exec` (macOS `.local`, `.directory(_:shell:)`) | `posix_spawn` in its own process group |
+| `WebAssembly.compile`, `instantiate` (code mode's QuickJS) | JavaScriptCore's synchronous `WebAssembly.Module` (its promise APIs need a run loop) |
+| pi-durable `ImageProcessor` | ImageIO (`NativeImageProcessor`) |
 
 `TextEncoder`/`TextDecoder`, `AbortController`, `EventTarget`, `Blob`/`FormData`, and `Headers`/`Request`/`Response` are implemented in TypeScript; `ReadableStream` comes from `web-streams-polyfill` and newer ECMAScript built-ins from `core-js`. All JavaScript runs on one serial queue per `Runtime`, which is also the executor of the actor that owns the `JSContext`. Swift and JavaScript talk through a small JSON bridge (`JS/src/bridge/`).
 
@@ -512,12 +560,12 @@ Use `Runtime(configuration:)` to give agents their own JavaScript thread or a cu
 
 ## Updating pi-durable
 
-The bundled versions are pinned exactly in `JS/package.json` and exposed as `PiDurable.version`, `PiDurable.piAIVersion`, and `PiDurable.chordVersion`.
+The bundled versions are pinned exactly in `JS/package.json` and exposed as `PiDurable.version`, `PiDurable.piAIVersion`, `PiDurable.chordVersion`, and `PiDurable.piCodemodeVersion`.
 
 ```sh
 cd JS
 npm ci
-npm run update            # latest pi-durable, with the pi-ai and chord releases it depends on
+npm run update            # latest pi-durable, with the pi-ai, chord, and pi-codemode releases it depends on
 npm run update -- 1.0.5   # or a specific version
 cd .. && swift test
 ```

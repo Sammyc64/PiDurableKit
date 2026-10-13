@@ -209,23 +209,25 @@ public struct Transaction: Sendable {
     ///   - conversation: The task's conversation; defaults to the commit's conversation, if it has one.
     ///   - task: The owning task, for child tasks; by default the conversation owns it.
     ///   - background: Survives the conversation's abort and does not keep it busy.
+    ///   - abandonOnRestart: Its creator awaits it only in memory: when a later harness starts scheduling, the task, if
+    ///     still live, is aborted with the work it owns before any of it runs again.
     @discardableResult
     public func createTask<Input, State, Result>(
         _ type: TaskType<Input, State, Result>, input: Input, in conversation: ConversationID? = nil,
-        ownedBy task: TaskID? = nil, background: Bool = false
+        ownedBy task: TaskID? = nil, background: Bool = false, abandonOnRestart: Bool = false
     ) async throws -> TaskID {
         try await handle.call(
             "tx.createTask",
             [
                 "task": type.name, "input": try JSONValue(encoding: input), "conversation": conversation, "ownerTask": task,
-                "background": background,
+                "background": background, "abandonOnRestart": abandonOnRestart,
             ])
     }
 
     // MARK: Raw submissions
 
     /// Creates a raw submission record with a fresh ID. No admission rules apply: no busy check, no inbox queueing, no
-    /// placement. Use ``Conversation/submit(_:whenBusy:requestId:)`` unless you implement admission yourself.
+    /// placement. Use ``Conversation/submit(_:whenBusy:requestId:entry:)-(String,_,_,_)`` unless you implement admission yourself.
     @discardableResult
     public func createSubmission(_ submission: SubmissionDraftRecord) async throws -> SubmissionRecord {
         try await handle.call("tx.createSubmission", ["submission": submission])
@@ -371,24 +373,22 @@ public struct ConversationHandle: Sendable, Identifiable {
     let handle: ScopeHandle
     let harness: Harness
 
-    /// Admits user input, like `Conversation.submit(_:whenBusy:requestId:)`.
+    /// Admits user input, like `Conversation.submit(_:whenBusy:requestId:entry:)`.
     @discardableResult
-    public func submit(_ text: String, whenBusy: Conversation.WhenBusy = .followUp, requestId: String? = nil) async throws
-        -> Submission
-    {
-        try await submit([.text(text)], whenBusy: whenBusy, requestId: requestId)
+    public func submit(
+        _ text: String, whenBusy: Conversation.WhenBusy = .followUp, requestId: String? = nil, entry: InputEntry? = nil
+    ) async throws -> Submission {
+        try await submit([.text(text)], whenBusy: whenBusy, requestId: requestId, entry: entry)
     }
 
     /// Admits user input made of text and images.
     @discardableResult
-    public func submit(_ content: [ContentBlock], whenBusy: Conversation.WhenBusy = .followUp, requestId: String? = nil)
-        async throws -> Submission
-    {
-        let content: JSONValue =
-            if content.count == 1, let text = content[0].text { .string(text) } else { try JSONValue(encoding: content) }
-        var submission: JSONObject = ["type": "input", "content": content, "whenBusy": .string(whenBusy.rawValue)]
-        if let requestId { submission["requestId"] = .string(requestId) }
-        let id: SubmissionID = try await handle.call("conversationHandle.submit", ["submission": JSONValue.object(submission)])
+    public func submit(
+        _ content: [ContentBlock], whenBusy: Conversation.WhenBusy = .followUp, requestId: String? = nil,
+        entry: InputEntry? = nil
+    ) async throws -> Submission {
+        let submission = try InputEntry.submission(content, whenBusy: whenBusy, requestId: requestId, entry: entry)
+        let id: SubmissionID = try await handle.call("conversationHandle.submit", ["submission": submission])
         return Submission(harness: harness, id: id)
     }
 

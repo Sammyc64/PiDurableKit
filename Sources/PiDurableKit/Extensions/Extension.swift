@@ -24,7 +24,7 @@ public struct Extension: Sendable, Identifiable {
     public var wraps: [Wrap]
     /// Durable task types, resolved by name for every task whatever the conversation selects.
     public var tasks: [AnyTaskType]
-    let builtin: [BuiltinTool]?
+    let builtin: Builtin?
     let javaScript: (source: String, sourceURL: URL?)?
 
     public init(
@@ -54,7 +54,19 @@ public struct Extension: Sendable, Identifiable {
         }
     }
 
-    private init(builtin: [BuiltinTool], name: String) {
+    /// An extension pi-durable provides.
+    enum Builtin {
+        case tools([BuiltinTool], images: (any ImageProcessor)?)
+        case toolSearch
+        case codemode(CodemodeOptions)
+
+        var tools: [BuiltinTool] {
+            if case .tools(let tools, _) = self { return tools }
+            return []
+        }
+    }
+
+    private init(builtin: Builtin, name: String) {
         self.name = name
         self.tools = []
         self.sections = []
@@ -69,7 +81,8 @@ public struct Extension: Sendable, Identifiable {
     ///
     /// `source` is a CommonJS module whose `module.exports` is a pi-durable extension. It can `require`
     /// `@earendil-works/pi-durable`, `@earendil-works/pi-durable/tools`, `@earendil-works/pi-durable/env`,
-    /// `@earendil-works/pi-ai`, and `@earendil-works/chord/context`:
+    /// `@earendil-works/pi-durable/tool-search`, `@earendil-works/pi-durable/codemode`,
+    /// `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`, and `@earendil-works/chord/context`:
     ///
     /// ```js
     /// const { defineExtension, defineTool } = require("@earendil-works/pi-durable");
@@ -79,7 +92,7 @@ public struct Extension: Sendable, Identifiable {
     ///     name: "dice",
     ///     tools: [defineTool({
     ///         name: "roll", description: "Roll a die", parameters: Type.Object({ sides: Type.Number() }),
-    ///         execute: async (args) => ({ content: [{ type: "text", text: String(1 + Math.floor(Math.random() * args.sides)) }] }),
+    ///         execute: async (args) => ({ output: [{ type: "text", text: String(1 + Math.floor(Math.random() * args.sides)) }] }),
     ///     })],
     /// });
     /// ```
@@ -98,25 +111,67 @@ public struct Extension: Sendable, Identifiable {
     }
 
     /// pi-durable's `read`, `write`, and `edit` tools, working in the harness's ``ExecutionEnvironment``, and with
-    /// `shell` its `bash` tool too, like pi-durable's `CodingTools`. Commands need an environment with a shell, such as
-    /// ``ExecutionEnvironment/local`` on macOS; there is none on iOS.
-    public static func codingTools(name: String = "coding", shell: Bool = false) -> Extension {
-        Extension(builtin: shell ? [.read, .write, .edit, .bash()] : [.read, .write, .edit], name: name)
+    /// `shell` its `bash` tool too, like pi-durable's `createCodingTools()`. Commands need an environment with a shell,
+    /// such as ``ExecutionEnvironment/local`` on macOS; there is none on iOS.
+    ///
+    /// - Parameters:
+    ///   - name: The extension's name.
+    ///   - shell: Include `bash`.
+    ///   - images: Prepares the images `read` returns: orients, converts, and shrinks them to the model's limits. Without
+    ///     one, images within the byte limit pass through as they are. ``NativeImageProcessor`` uses ImageIO.
+    public static func codingTools(name: String = "coding", shell: Bool = false, images: (any ImageProcessor)? = nil) -> Extension {
+        Extension(builtin: .tools(shell ? [.read, .write, .edit, .bash()] : [.read, .write, .edit], images: images), name: name)
     }
 
     /// An extension of pi-durable's built-in tools (`@earendil-works/pi-durable/tools`), in order.
     ///
     /// ```swift
-    /// let readOnly = Extension.builtinTools(name: "read-only", [.read])
+    /// let readOnly = Extension.builtinTools(name: "read-only", [.read], images: .native)
     /// let shell = Extension.builtinTools(name: "shell", [.bash(commandPrefix: "source .venv/bin/activate")])
     /// ```
-    public static func builtinTools(name: String, _ tools: [BuiltinTool]) -> Extension {
-        Extension(builtin: tools, name: name)
+    ///
+    /// - Parameters:
+    ///   - name: The extension's name.
+    ///   - tools: The tools, in order.
+    ///   - images: Prepares the images `read` returns; see ``codingTools(name:shell:images:)``.
+    public static func builtinTools(name: String, _ tools: [BuiltinTool], images: (any ImageProcessor)? = nil) -> Extension {
+        Extension(builtin: .tools(tools, images: images), name: name)
+    }
+
+    /// pi-durable's `tool_search` tool (`@earendil-works/pi-durable/tool-search`): the model searches the deferred tools
+    /// it is not offered yet (``Tool/deferred``), and the matches are loaded, so the next request offers them. Select it
+    /// where the model should find deferred tools.
+    public static func toolSearch(name: String = "tool-search") -> Extension {
+        Extension(builtin: .toolSearch, name: name)
+    }
+
+    /// pi-durable's durable code mode (`@earendil-works/pi-durable/codemode`): a `codemode` tool whose JavaScript scripts
+    /// call the conversation's tools as nested calls and survive a restart, and a `codemode` prompt section listing the
+    /// tools scripts can call.
+    ///
+    /// Scripts run in QuickJS (WebAssembly) on the runtime's JavaScript thread: while a script computes without
+    /// awaiting a tool, the runtime's other work waits, up to `interruptBudget`. WebAssembly needs JavaScriptCore with
+    /// WebAssembly support, as on macOS and the iOS Simulator.
+    public static func codemode(name: String = "codemode", _ options: CodemodeOptions = CodemodeOptions()) -> Extension {
+        Extension(builtin: .codemode(options), name: name)
     }
 
     var specification: BridgeArguments {
-        if let builtin {
-            return ["name": name, "builtin": "tools", "builtinTools": builtin.enumerated().map { $1.specification(index: $0) }]
+        switch builtin {
+        case .tools(let tools, let images)?:
+            return [
+                "name": name, "builtin": "tools",
+                "builtinTools": tools.enumerated().map { $1.specification(index: $0, images: images != nil) },
+            ]
+        case .toolSearch?:
+            return ["name": name, "builtin": "toolSearch"]
+        case .codemode(let options)?:
+            return [
+                "name": name, "builtin": "codemode", "wasmPath": CodemodeOptions.quickJSPath,
+                "namespaces": options.namespaces.isEmpty ? nil : options.namespaces, "inlineBudget": options.inlineBudget,
+                "models": options.models, "interruptBudget": options.interruptBudget,
+            ]
+        case nil: break
         }
         if let javaScript {
             return ["name": name, "javaScript": javaScript.source, "sourceURL": javaScript.sourceURL?.absoluteString]
@@ -494,9 +549,15 @@ public struct ToolDefinition: Codable, Sendable, Hashable {
     public var replay: Tool.Replay?
     public var executionMode: Settings.ToolExecution?
     public var outputLimits: Tool.OutputLimits?
+    /// The JSON schema of the tool's structured output.
+    public var structuredOutputSchema: JSONValue?
+    /// Who may call the tool; `nil` for both the model and other tools.
+    public var callers: [Tool.Caller]?
+    /// Whether the tool is kept from the model until loaded.
+    public var deferred: Bool?
 }
 
-/// One of pi-durable's built-in tools, for ``Extension/builtinTools(name:_:)``. They work in the call's
+/// One of pi-durable's built-in tools, for ``Extension/builtinTools(name:_:images:)``. They work in the call's
 /// ``ExecutionEnvironment`` and fail with an error result without one.
 public enum BuiltinTool: Sendable {
     /// `read`: reads text files, with offsets and truncation.
@@ -524,9 +585,9 @@ public enum BuiltinTool: Sendable {
         }
     }
 
-    func specification(index: Int) -> JSONValue {
+    func specification(index: Int, images: Bool) -> JSONValue {
         switch self {
-        case .read: return ["kind": "read"]
+        case .read: return ["kind": "read", "index": .number(Double(index)), "images": .bool(images)]
         case .write: return ["kind": "write"]
         case .edit: return ["kind": "edit"]
         case .bash(let prefix, let prepare):
@@ -550,4 +611,44 @@ public struct BashExecution: Codable, Sendable, Hashable {
     public var env: [String: String]
     /// Whether the host's environment variables are inherited.
     public var inheritEnv: Bool
+}
+
+/// Options of ``Extension/codemode(name:_:)`` (pi-durable `CodemodeToolOptions`).
+public struct CodemodeOptions: Sendable {
+    /// A group of tools by name prefix, such as an MCP server's, for the `codemode` section and tool search.
+    public struct Namespace: Encodable, Sendable, Hashable {
+        public var name: String
+        /// Tool names starting with it belong to the namespace; the longest matching prefix wins.
+        public var prefix: String
+        public var description: String?
+        public var instructions: String?
+
+        public init(_ name: String, prefix: String, description: String? = nil, instructions: String? = nil) {
+            self.name = name
+            self.prefix = prefix
+            self.description = description
+            self.instructions = instructions
+        }
+    }
+
+    public var namespaces: [Namespace]
+    /// Estimated tokens the tool declarations in the `codemode` section may use; default 3000.
+    public var inlineBudget: Int?
+    /// Give scripts `models.*`: the model catalog, classifiers, and image generation; default `true`.
+    public var models: Bool?
+    /// Interrupt polls a script may use computing without awaiting a tool before it fails as timed out; default
+    /// 100,000, roughly 2 to 10 seconds.
+    public var interruptBudget: Int?
+
+    public init(namespaces: [Namespace] = [], inlineBudget: Int? = nil, models: Bool? = nil, interruptBudget: Int? = nil) {
+        self.namespaces = namespaces
+        self.inlineBudget = inlineBudget
+        self.models = models
+        self.interruptBudget = interruptBudget
+    }
+
+    /// The bundled `quickjs.wasm`.
+    static var quickJSPath: String {
+        Bundle.module.url(forResource: "quickjs", withExtension: "wasm")!.path(percentEncoded: false)
+    }
 }

@@ -10,4 +10,9 @@ export declare class Waiters<K, T> {
 }
 /** Every item of a paginated scan, in page order. */
 export declare function scanAll<T>(scan: (cursor: Cursor | undefined) => Promise<Page<T, Cursor>>): Promise<T[]>;
-export declare function closedError(): Error;
+/** What a closed Harness rejects with: `SessionFailed` with the cause when it closed because the Session failed. */
+export declare function closedError(session: {
+    readonly failure: {
+        readonly error: unknown;
+    } | undefined;
+}): Error;

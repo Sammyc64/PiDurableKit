@@ -190,6 +190,7 @@ final class HostRouter: Sendable {
             switch method {
             case "tool.execute": try await executeTool(arguments)
             case "tool.prepareShell": try await prepareShell(arguments)
+            case "images.prepare": try await prepareImage(arguments)
             case "section.render": try await renderSection(arguments)
             case "hook.beforeTool": try await beforeTool(arguments)
             case "hook.afterTool": try await afterTool(arguments)
@@ -341,12 +342,20 @@ final class HostRouter: Sendable {
     private func prepareShell(_ arguments: JSONValue) async throws -> BashExecution {
         let found = try extensionNamed(arguments)
         let index = arguments["index"]?.intValue ?? -1
-        guard let tools = found.builtin, tools.indices.contains(index), let prepare = tools[index].prepare else {
+        let tools = found.builtin?.tools ?? []
+        guard tools.indices.contains(index), let prepare = tools[index].prepare else {
             throw PiDurableError.notFound("Shell tool \(index) of \(found.name)")
         }
         var execution = try (arguments["execution"] ?? [:]).decode(as: BashExecution.self)
         try await prepare(&execution, try toolContext(arguments))
         return execution
+    }
+
+    private func prepareImage(_ arguments: JSONValue) async throws -> PreparedImage? {
+        guard case .tools(_, let images?)? = try extensionNamed(arguments).builtin else { return nil }
+        let data = Data(base64Encoded: arguments["data"]?.stringValue ?? "") ?? Data()
+        let limits = try (arguments["limits"] ?? [:]).decode(as: ImageLimits.self)
+        return try await images.prepare(data, mimeType: arguments["mimeType"]?.stringValue ?? "", limits: limits)
     }
 
     private func prepareArguments(_ arguments: JSONValue) throws -> JSONValue {
@@ -540,7 +549,7 @@ final class HostRouter: Sendable {
 
     private func conversationCreated(_ arguments: JSONValue) async throws -> JSONValue? {
         let registration = try registration(arguments)
-        guard let callback = registration.callbacks.onConversationCreated, let harness = registration.harness else { return nil }
+        guard let callback = registration.callbacks.onConversationCreated, registration.harness != nil else { return nil }
         let record = try (arguments["record"] ?? [:]).decode(as: ConversationRecord.self)
         let transaction = Transaction(handle: ScopeHandle(engine: try engine, id: arguments["tx"]?.intValue ?? 0))
         try await callback(transaction, record)

@@ -36,6 +36,24 @@ public struct Tool: Sendable, Identifiable {
     public var prepareArguments: (@Sendable (JSONValue) -> JSONValue)?
     /// Bounds on the output a call keeps; see ``OutputLimits``.
     public var outputLimits: OutputLimits?
+    /// The JSON schema of ``ToolResult/structuredOutput``, which programs that call the tool receive. `nil`: they
+    /// receive the tool's bounded output instead.
+    public var structuredOutputSchema: JSONSchema?
+    /// Who may call the tool: the model, other tools through ``ToolCallContext/executeTool(_:arguments:key:progress:)-(_,JSONObject,_,_)``,
+    /// or both (the default).
+    public var callers: Set<Caller>
+    /// Not offered to the model until loaded: the model gets the tool only when a conversation's
+    /// ``AgentChange/modelTools`` names it, which ``ToolResult/addTools`` (from a tool such as
+    /// ``Extension/toolSearch(name:)``) writes. Other tools can call it any time.
+    public var deferred: Bool
+
+    /// Who calls a tool.
+    public enum Caller: String, Codable, Sendable, CaseIterable {
+        /// The model, in a tool round.
+        case model
+        /// Other tools, as nested calls.
+        case tools
+    }
     let execute: @Sendable (JSONValue, ToolCallContext) async throws -> ToolResult
 
     /// Bounds on the running output a call keeps, and whether it keeps the head or the tail.
@@ -69,6 +87,27 @@ public struct Tool: Sendable, Identifiable {
         return copy
     }
 
+    /// The same tool declaring the schema of its ``ToolResult/structuredOutput``.
+    public func returningStructuredOutput(_ schema: JSONSchema) -> Tool {
+        var copy = self
+        copy.structuredOutputSchema = schema
+        return copy
+    }
+
+    /// The same tool, callable only by these callers.
+    public func callable(by callers: Set<Caller>) -> Tool {
+        var copy = self
+        copy.callers = callers
+        return copy
+    }
+
+    /// The same tool, kept from the model until loaded (see ``deferred``).
+    public func deferringUntilLoaded() -> Tool {
+        var copy = self
+        copy.deferred = true
+        return copy
+    }
+
     /// A tool whose arguments decode as `Arguments`.
     public init<Arguments: Decodable & Sendable, Output: ToolOutput>(
         _ name: String,
@@ -83,6 +122,8 @@ public struct Tool: Sendable, Identifiable {
         self.parameters = parameters
         self.replay = replay
         self.executionMode = executionMode
+        self.callers = [.model, .tools]
+        self.deferred = false
         self.execute = { arguments, context in
             let decoded: Arguments
             do {
@@ -107,6 +148,8 @@ public struct Tool: Sendable, Identifiable {
         self.parameters = .object()
         self.replay = replay
         self.executionMode = executionMode
+        self.callers = [.model, .tools]
+        self.deferred = false
         self.execute = { _, context in try await execute(context).toolResult }
     }
 
@@ -119,6 +162,9 @@ public struct Tool: Sendable, Identifiable {
             "executionMode": executionMode?.rawValue,
             "outputLimits": outputLimits,
             "prepares": prepareArguments != nil,
+            "structuredOutputSchema": structuredOutputSchema,
+            "callers": callers == [.model, .tools] ? nil : Tool.Caller.allCases.filter(callers.contains).map(\.rawValue),
+            "deferred": deferred ? true : nil,
         ]
     }
 }
@@ -129,10 +175,15 @@ struct ToolArgumentsError: Error, LocalizedError {
     var errorDescription: String? { "Invalid arguments for \(tool): \(underlying)" }
 }
 
-/// What a tool returns to the model.
+/// What a tool returns (pi-durable `ToolExecutionResult`), on three channels: ``output`` for the model,
+/// ``structuredOutput`` for programs that call the tool (``ToolCallContext/executeTool(_:arguments:key:progress:)-(_,JSONObject,_,_)``
+/// callers, code mode scripts), and ``details`` for UIs.
 public struct ToolResult: Sendable, Encodable, ExpressibleByStringLiteral, ExpressibleByStringInterpolation {
-    /// The content the model sees. `nil` uses the output streamed with ``ToolCallContext/output(_:)``.
-    public var content: [ContentBlock]?
+    /// For the model. `nil` uses the output streamed with ``ToolCallContext/output(_:)-(String)``.
+    public var output: [ContentBlock]?
+    /// For programs. Required unless ``isError`` when the tool declares ``Tool/structuredOutputSchema``, and validated
+    /// against it; not allowed without one, where programs get the output itself.
+    public var structuredOutput: JSONValue?
     public var isError: Bool
     /// App-facing data stored on the result; not shown to the model.
     public var details: JSONValue?
@@ -140,13 +191,42 @@ public struct ToolResult: Sendable, Encodable, ExpressibleByStringLiteral, Expre
     public var terminate: Bool
     /// Starts a new context from this handoff note.
     public var handoff: String?
-    /// Tools to offer from the next request on, by name; they must belong to a selected extension.
+    /// Tools to offer from the next request on, by name, including deferred ones (``Tool/deferred``).
     public var addTools: [String]
     /// Remarks for the model and the UI, added after those recorded with ``ToolCallContext/diagnostic(_:)``.
     public var diagnostics: [ToolDiagnostic]
     /// Spend of the tool's own work, such as a model call.
     public var usage: Usage?
 
+    @available(*, deprecated, renamed: "output")
+    public var content: [ContentBlock]? {
+        get { output }
+        set { output = newValue }
+    }
+
+    public init(
+        output: [ContentBlock]?,
+        structuredOutput: JSONValue? = nil,
+        isError: Bool = false,
+        details: JSONValue? = nil,
+        terminate: Bool = false,
+        handoff: String? = nil,
+        addTools: [String] = [],
+        diagnostics: [ToolDiagnostic] = [],
+        usage: Usage? = nil
+    ) {
+        self.output = output
+        self.structuredOutput = structuredOutput
+        self.diagnostics = diagnostics
+        self.isError = isError
+        self.details = details
+        self.terminate = terminate
+        self.handoff = handoff
+        self.addTools = addTools
+        self.usage = usage
+    }
+
+    @available(*, deprecated, renamed: "init(output:structuredOutput:isError:details:terminate:handoff:addTools:diagnostics:usage:)")
     public init(
         content: [ContentBlock]?,
         isError: Bool = false,
@@ -157,38 +237,39 @@ public struct ToolResult: Sendable, Encodable, ExpressibleByStringLiteral, Expre
         diagnostics: [ToolDiagnostic] = [],
         usage: Usage? = nil
     ) {
-        self.diagnostics = diagnostics
-        self.content = content
-        self.isError = isError
-        self.details = details
-        self.terminate = terminate
-        self.handoff = handoff
-        self.addTools = addTools
-        self.usage = usage
+        self.init(
+            output: content, isError: isError, details: details, terminate: terminate, handoff: handoff, addTools: addTools,
+            diagnostics: diagnostics, usage: usage)
     }
 
     public init(stringLiteral value: String) {
-        self.init(content: [.text(value)])
+        self.init(output: [.text(value)])
     }
 
     /// A text result.
     public static func text(_ text: String, details: JSONValue? = nil) -> ToolResult {
-        ToolResult(content: [.text(text)], details: details)
+        ToolResult(output: [.text(text)], details: details)
     }
 
     /// An error result the model sees.
     public static func error(_ message: String, details: JSONValue? = nil) -> ToolResult {
-        ToolResult(content: [.text(message)], isError: true, details: details)
+        ToolResult(output: [.text(message)], isError: true, details: details)
     }
 
-    /// A result made of the output streamed with ``ToolCallContext/output(_:)``.
-    public static var streamedOutput: ToolResult { ToolResult(content: nil) }
+    /// A result made of the output streamed with ``ToolCallContext/output(_:)-(String)``.
+    public static var streamedOutput: ToolResult { ToolResult(output: nil) }
 
     /// An image result.
     public static func image(_ data: Data, mimeType: String, caption: String? = nil) -> ToolResult {
-        var content: [ContentBlock] = [.image(ImageContent(data: data, mimeType: mimeType))]
-        if let caption { content.insert(.text(caption), at: 0) }
-        return ToolResult(content: content)
+        var output: [ContentBlock] = [.image(ImageContent(data: data, mimeType: mimeType))]
+        if let caption { output.insert(.text(caption), at: 0) }
+        return ToolResult(output: output)
+    }
+
+    /// A result whose structured output, for programs, is `value`, and whose output for the model is its JSON text.
+    public static func structured(_ value: some Encodable & Sendable, details: JSONValue? = nil) throws -> ToolResult {
+        let json = try JSONValue(encoding: value)
+        return ToolResult(output: [.text(json.stringValue ?? json.jsonString)], structuredOutput: json, details: details)
     }
 
     /// Ends the run after this round instead of asking the model again.
@@ -205,9 +286,17 @@ public struct ToolResult: Sendable, Encodable, ExpressibleByStringLiteral, Expre
         return copy
     }
 
+    /// The same result with structured output for programs.
+    public func withStructuredOutput(_ value: JSONValue) -> ToolResult {
+        var copy = self
+        copy.structuredOutput = value
+        return copy
+    }
+
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: AnyKey.self)
-        try container.encodeIfPresent(content, forKey: AnyKey("content"))
+        try container.encodeIfPresent(output, forKey: AnyKey("output"))
+        try container.encodeIfPresent(structuredOutput, forKey: AnyKey("structuredOutput"))
         if isError { try container.encode(true, forKey: AnyKey("isError")) }
         if !diagnostics.isEmpty { try container.encode(diagnostics, forKey: AnyKey("diagnostics")) }
         try container.encodeIfPresent(details, forKey: AnyKey("details"))
@@ -225,7 +314,8 @@ public struct ToolResult: Sendable, Encodable, ExpressibleByStringLiteral, Expre
 extension ToolResult: Decodable {
     public init(from decoder: Decoder) throws {
         let json = try JSONValue(from: decoder)
-        content = try json["content"].map { try $0.decode(as: [ContentBlock].self) }
+        output = try (json["output"] ?? json["content"]).map { try $0.decode(as: [ContentBlock].self) }
+        structuredOutput = json["structuredOutput"]
         isError = json["isError"]?.boolValue ?? false
         details = json["details"]
         terminate = json["control"]?["terminate"]?.boolValue ?? false
@@ -322,15 +412,24 @@ public struct ToolCallContext: Sendable {
 
     /// Creates a durable task owned by this call (aborted with it), or with `ownedByConversation` a top-level task of
     /// the conversation.
+    ///
+    /// - Parameters:
+    ///   - type: The installed task type.
+    ///   - input: The task's input.
+    ///   - ownedByConversation: Make it a top-level task of the conversation instead of this call's.
+    ///   - background: Survives the conversation's abort and does not keep it busy.
+    ///   - abandonOnRestart: Whether a later harness aborts the task after a restart; by default `true` for a task this
+    ///     call owns when the tool is not ``Tool/Replay/safe``, since the call never resumes to await it.
     @discardableResult
     public func createTask<Input, State, Result>(
-        _ type: TaskType<Input, State, Result>, input: Input, ownedByConversation: Bool = false, background: Bool = false
+        _ type: TaskType<Input, State, Result>, input: Input, ownedByConversation: Bool = false, background: Bool = false,
+        abandonOnRestart: Bool? = nil
     ) async throws -> TaskID {
         try await handle.call(
             "scope.createTask",
             [
                 "task": type.name, "input": try JSONValue(encoding: input), "ownedByConversation": ownedByConversation,
-                "background": background,
+                "background": background, "abandonOnRestart": abandonOnRestart,
             ])
     }
 
@@ -354,28 +453,67 @@ public struct ToolCallContext: Sendable {
         try await handle.environment()
     }
 
-    /// The tools the calling conversation is offered, with their schemas (pi-durable `api.agent().tools`): the
-    /// selected extensions' tools, with wraps applied and the agent's tool filter.
+    /// The tools the calling conversation offers the model, with their schemas (pi-durable `api.agent().tools`): the
+    /// selected extensions' tools, with wraps applied and the agent's tool filters.
     public func tools() async throws -> [OfferedTool] {
         try await handle.call("scope.tools")
     }
 
-    /// Calls a tool the calling conversation is offered, as part of this call.
-    ///
-    /// The tool runs as the harness runs a tool call: its ``Tool/prepareArguments`` repair and its schema check run
-    /// first, then its `execute` with this call's context. Invalid arguments and a throwing tool become error results,
-    /// with an `invalid_arguments` or `tool_error` diagnostic. What the tool reports while it runs (output, details,
-    /// diagnostics) goes into the result it returns, not into this call's.
-    ///
-    /// The called tool is not a tool call of its own: it has no entry in the transcript and no task, and tool hooks
-    /// don't run for it. Throws when the conversation isn't offered the tool.
-    public func callTool(_ name: String, arguments: JSONValue = [:]) async throws -> ToolResult {
-        try await handle.call("scope.callTool", ["name": name, "arguments": arguments])
+    /// The tools nested calls resolve among (pi-durable `api.agent().callable`): enabled and callable by tools.
+    public func callableTools() async throws -> [OfferedTool] {
+        try await handle.call("scope.tools", ["callable": true])
     }
 
-    /// Calls a tool the calling conversation is offered, with arguments encoded as JSON.
+    /// Runs a tool as a nested call of this one and waits for its result (pi-durable `api.executeTool()`).
+    ///
+    /// The nested call is its own durable `pi.tool` task owned by this call: it resolves the tool among the
+    /// conversation's tools callable by tools (``Agent/callable``), repairs and validates the arguments, runs the tool
+    /// hooks (which see ``ToolCall/parent``), applies output limits and the tool's replay policy, and shows its progress
+    /// in ``LiveState/nestedTools``. Its result returns here instead of entering the transcript; a call that is
+    /// blocked, invalid, throws, is interrupted, or is aborted returns an error result.
+    ///
+    /// - Parameters:
+    ///   - name: The tool.
+    ///   - arguments: Its arguments.
+    ///   - key: Names the nested call within this one; by default its position among this call's nested calls. A rerun
+    ///     of a ``Tool/Replay/safe`` tool that makes a call with a used key gets that call back instead of starting
+    ///     another. Must be non-empty, without `/`, and not a positive integer.
+    ///   - progress: `false` keeps the nested call's running output, details, and diagnostics out of ``LiveState``.
+    public func executeTool(
+        _ name: String, arguments: JSONObject = [:], key: String? = nil, progress: Bool? = nil
+    ) async throws -> NestedToolResult {
+        try await handle.call(
+            "scope.executeTool", ["name": name, "arguments": JSONValue.object(arguments), "key": key, "progress": progress])
+    }
+
+    /// Runs a tool as a nested call, with arguments encoded as a JSON object.
+    public func executeTool(
+        _ name: String, arguments: some Encodable & Sendable, key: String? = nil, progress: Bool? = nil
+    ) async throws -> NestedToolResult {
+        guard case .object(let object) = try JSONValue(encoding: arguments) else {
+            throw PiDurableError.runtime("Tool arguments must encode as a JSON object")
+        }
+        return try await executeTool(name, arguments: object, key: key, progress: progress)
+    }
+
+    /// Calls a tool as part of this call. Now a durable nested call; see ``executeTool(_:arguments:key:progress:)-(_,JSONObject,_,_)``,
+    /// which also returns structured output.
+    @available(*, deprecated, renamed: "executeTool(_:arguments:key:progress:)")
+    public func callTool(_ name: String, arguments: JSONValue = [:]) async throws -> ToolResult {
+        try await executeTool(name, arguments: arguments.objectValue ?? [:]).toolResult
+    }
+
+    @available(*, deprecated, renamed: "executeTool(_:arguments:key:progress:)")
     public func callTool(_ name: String, arguments: some Encodable & Sendable) async throws -> ToolResult {
-        try await callTool(name, arguments: JSONValue(encoding: arguments))
+        try await executeTool(name, arguments: arguments).toolResult
+    }
+
+    /// The output retained so far, as the model will see it when the result omits ``ToolResult/output``, and whether
+    /// earlier output was dropped (pi-durable `api.retainedOutput()`).
+    public func retainedOutput() async throws -> (text: String, truncated: Bool) {
+        struct Retained: Decodable { let text: String; let truncated: Bool }
+        let retained: Retained = try await handle.call("scope.retainedOutput")
+        return (retained.text, retained.truncated)
     }
 
     /// A durable value of this call: the stored one, or `candidate` stored now. A replay-safe tool uses memos to find
@@ -429,5 +567,68 @@ public struct ToolDiagnostic: Codable, Sendable, Hashable {
         self.severity = severity
         self.message = message
         self.code = code
+    }
+}
+
+/// The result of a nested call (pi-durable `NestedToolExecutionResult`). Programs read ``structuredOutput``; the
+/// output for the model is not kept.
+public struct NestedToolResult: Decodable, Sendable, Hashable {
+    /// The nested call's tool task.
+    public let taskId: TaskID
+    /// The tool's value for programs: its validated ``ToolResult/structuredOutput`` when it declares
+    /// ``Tool/structuredOutputSchema``; otherwise its bounded output, as a string for one text item, an image for one
+    /// image, `""` for none, and the content list otherwise. `nil` on an error the harness wrote itself.
+    public let structuredOutput: JSONValue?
+    public let isError: Bool
+    public let details: JSONValue?
+    public let diagnostics: [ToolDiagnostic]
+    public let usage: Usage?
+    /// Execution time of the attempt that produced the result.
+    public let duration: Duration?
+
+    private enum CodingKeys: String, CodingKey { case taskId, structuredOutput, isError, details, diagnostics, usage, durationMs }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        taskId = try container.decode(TaskID.self, forKey: .taskId)
+        structuredOutput = try container.decodeIfPresent(JSONValue.self, forKey: .structuredOutput)
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
+        details = try container.decodeIfPresent(JSONValue.self, forKey: .details)
+        diagnostics = (try? container.decodeIfPresent([ToolDiagnostic].self, forKey: .diagnostics)) ?? []
+        usage = try? container.decodeIfPresent(Usage.self, forKey: .usage)
+        duration = try container.decodeIfPresent(Double.self, forKey: .durationMs).map { .milliseconds($0) }
+    }
+
+    /// The text of the output: a string, or the text items of a content list; for an error the harness wrote, its
+    /// diagnostics.
+    public var text: String {
+        if let string = structuredOutput?.stringValue { return string }
+        if let items = structuredOutput?.arrayValue { return items.compactMap { $0["text"]?.stringValue }.joined() }
+        if structuredOutput == nil { return diagnostics.map(\.message).joined(separator: "\n") }
+        return structuredOutput?.jsonString ?? ""
+    }
+
+    /// Decodes the structured output as `T`.
+    public func decode<T: Decodable>(as type: T.Type = T.self) throws -> T {
+        try (structuredOutput ?? .null).decode(as: T.self)
+    }
+
+    /// The result as a ``ToolResult``, its output made from the structured output.
+    public var toolResult: ToolResult {
+        var output: [ContentBlock]
+        switch structuredOutput {
+        case .string(let text)?: output = text.isEmpty ? [] : [.text(text)]
+        case .array(let items)?: output = (try? JSONValue.array(items).decode(as: [ContentBlock].self)) ?? [.text(text)]
+        case .object?:
+            if let image = try? structuredOutput?.decode(as: ImageContent.self), structuredOutput?["type"] == "image" {
+                output = [.image(image)]
+            } else {
+                output = [.text(text)]
+            }
+        case nil: output = diagnostics.isEmpty ? [] : [.text(text)]
+        default: output = [.text(text)]
+        }
+        return ToolResult(
+            output: output, isError: isError, details: details, diagnostics: diagnostics, usage: usage)
     }
 }

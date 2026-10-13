@@ -91,27 +91,59 @@ public struct LiveState: Decodable, Sendable, Hashable {
         public let entry: EntryID?
     }
 
+    /// One nested call: a call a running tool made with ``ToolCallContext/executeTool(_:arguments:key:progress:)-(_,JSONObject,_,_)``
+    /// (pi-durable `NestedToolSlot`).
+    public struct NestedToolSlot: Decodable, Sendable, Hashable, Identifiable {
+        public var id: String { callId }
+        /// `<parentCallId>/<key>`, the call's ID in tool events.
+        public let callId: String
+        public let name: String
+        /// The calling tool call.
+        public let parentCallId: String
+        public let parentTaskId: TaskID
+        /// The nested call's tool task.
+        public let taskId: TaskID
+        public let status: ToolSlot.Status
+        /// The arguments the call runs with, once it starts executing.
+        public let arguments: JSONObject
+        public let output: String?
+        public let droppedBytes: Int?
+        public let droppedLines: Int?
+        public let details: JSONValue?
+        public let diagnostics: [ToolDiagnostic]?
+        /// Once done: how the call ended.
+        public let summary: NestedToolSummary?
+    }
+
     /// Present exactly while the conversation is busy.
     public let run: Run?
     public let generation: Generation?
     public let tools: [ToolSlot]
+    /// Nested calls of running tool calls, parents before their children.
+    public let nestedTools: [NestedToolSlot]
     public let compactions: [Compaction]
+    /// The newest compaction failure since a compaction last produced a summary.
+    public let compactionFailure: CompactionFailure?
 
     init() {
         run = nil
         generation = nil
         tools = []
+        nestedTools = []
         compactions = []
+        compactionFailure = nil
     }
 
-    private enum CodingKeys: String, CodingKey { case run, generation, tools, compactions }
+    private enum CodingKeys: String, CodingKey { case run, generation, tools, nestedTools, compactions, compactionFailure }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         run = try? container.decodeIfPresent(Run.self, forKey: .run)
         generation = try? container.decodeIfPresent(Generation.self, forKey: .generation)
         tools = (try? container.decodeIfPresent([ToolSlot].self, forKey: .tools)) ?? []
+        nestedTools = (try? container.decodeIfPresent([NestedToolSlot].self, forKey: .nestedTools)) ?? []
         compactions = (try? container.decodeIfPresent([Compaction].self, forKey: .compactions)) ?? []
+        compactionFailure = try? container.decodeIfPresent(CompactionFailure.self, forKey: .compactionFailure)
     }
 }
 

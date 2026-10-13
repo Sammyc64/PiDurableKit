@@ -12,8 +12,11 @@ export declare function resolveSettings(settings: HarnessSettings | undefined): 
 /** Apply one change to `pi.agent`: a given field replaces the stored one, `null` clears it, `undefined` changes nothing. */
 export declare function configure(tx: Tx, conversationId: ConversationId, change: AgentChange): Promise<void>;
 /**
- * `addTools` of a tool round: an array gets each name it lacks appended, `{ remove }` loses the names, and unset tools
- * already offer every tool, so nothing is written.
+ * `addTools` of a tool round, applied to `tools` and `modelTools`, so the next request offers the tools: an array gets
+ * each name it lacks appended, and `{ remove }` loses the names. An unset `tools` already enables every tool, so nothing
+ * is written for it. An unset or object `modelTools` also gets each name appended to its `add`, which loads deferred
+ * tools and has no effect for others. By name, without the registry: a tool that is not registered now, such as one of
+ * an MCP server that is reconnecting, is offered once it is again.
  */
 export declare function addTools(tx: Tx, conversationId: ConversationId, added: readonly string[]): Promise<void>;
 /**

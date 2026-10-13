@@ -2,8 +2,8 @@ import type { Context, JsonValue } from "@earendil-works/chord";
 import type { AssistantMessage, Message, Usage } from "@earendil-works/pi-ai";
 import type { ConversationId, EntryRecord, JsonObject, SubmissionId, SubmissionRecord, TaskId, WatchEnd } from "../types.ts";
 import type { InboxItem } from "./inbox.ts";
-import type { CompactionStatus, ToolSlot } from "./live.ts";
-import type { AgentState, CompactionReason, Harness, ToolDiagnostic } from "./types.ts";
+import type { CompactionFailure, CompactionStatus, NestedToolSlot, ToolSlot } from "./live.ts";
+import type { AgentState, CompactionReason, Harness, NestedToolExecutionResult, ToolDiagnostic } from "./types.ts";
 import { type UsageState } from "./usage.ts";
 type Block = AssistantMessage["content"][number];
 type QueuedItem = {
@@ -51,8 +51,12 @@ export type SnapshotEvent = {
         };
     };
     tools: readonly ToolSlot[];
+    /** `pi.live.nestedTools`: nested calls of running tool calls. */
+    nestedTools: readonly NestedToolSlot[];
     /** `pi.live.compactions`: live compactions with their attempt and retry backoff. */
     compactions: readonly CompactionStatus[];
+    /** `pi.live.compactionFailure`: the newest compaction failure since a compaction last produced a summary. */
+    compactionFailure?: CompactionFailure;
     inbox: readonly QueuedItem[];
     /** `pi.agent`; `{}` when absent. */
     agent: AgentState;
@@ -81,15 +85,11 @@ export type AgentEvent = SnapshotEvent | {
 } | {
     type: "message_end";
     entry: EntryRecord;
-} | {
+} | ({
     type: "tool_execution_start";
-    toolCallId: string;
-    toolName: string;
     args: JsonObject;
-} | {
+} & ToolEventCall) | ({
     type: "tool_execution_update";
-    toolCallId: string;
-    toolName: string;
     /** A front trim and then an append of the retained window, or its replacement. */
     output?: {
         trimStart?: number;
@@ -99,14 +99,17 @@ export type AgentEvent = SnapshotEvent | {
     };
     details?: JsonValue;
     diagnostics?: readonly ToolDiagnostic[];
-}
-/** `entry` is absent when the tool task faulted or was orphaned. */
- | {
+} & ToolEventCall)
+/**
+ * A model-issued call ends with its result `entry`, a nested call with its `result`. Both are absent when the tool
+ * task faulted or was orphaned, or when the call's slot left `pi.live` unfinished: its run ended, or its parent
+ * settled first.
+ */
+ | ({
     type: "tool_execution_end";
-    toolCallId: string;
-    toolName: string;
     entry?: EntryRecord;
-} | {
+    result?: NestedToolExecutionResult;
+} & ToolEventCall) | {
     type: "inbox_update";
     items: readonly QueuedItem[];
 } | {
@@ -143,11 +146,28 @@ export type AgentEvent = SnapshotEvent | {
     reason: CompactionReason;
     blocking: boolean;
 }
-/** The task's receipt tells whether it produced a summary; the summary entry has its own events. */
+/**
+ * The task's receipt tells whether it produced a summary; the summary entry has its own events. `error` is set when
+ * the compaction failed, faulted, or was orphaned, as in `pi.live.compactionFailure`.
+ */
  | {
     type: "compaction_end";
     taskId: TaskId;
     reason: CompactionReason;
+    error?: string;
+};
+/**
+ * Which call a tool event is about. `toolCallId` is the call's ID in the transcript and in tool events: the provider's
+ * ID for a model-issued call, `<parent call ID>/<key>` for a nested one. Match events by it; do not parse it. `taskId`
+ * is the call's tool task, absent for a call that never got one (not offered, or not started in a sequential round).
+ * A nested call also names the call that made it, by call ID and by tool task.
+ */
+export type ToolEventCall = {
+    toolCallId: string;
+    toolName: string;
+    taskId?: TaskId;
+    parentToolCallId?: string;
+    parentTaskId?: TaskId;
 };
 /** Serialized stream of one conversation's event batches, one per commit. */
 export interface AgentEventStream {

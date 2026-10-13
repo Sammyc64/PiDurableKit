@@ -31,9 +31,20 @@ export function serializeError(error: unknown): Json {
 			conversationId: ((error as { conversationId?: unknown }).conversationId as Json) ?? null,
 			path: ((error as { path?: unknown }).path as Json) ?? null,
 			spillPath: ((error as { spillPath?: unknown }).spillPath as Json) ?? null,
+			// `SessionFailed` carries the storage error that failed the Session.
+			cause: error.cause === undefined ? null : serializeError(error.cause),
 		};
 	}
-	return { name: "Error", message: String(error), stack: null, code: null };
+	return { name: "Error", message: messageOf(error), stack: null, code: null };
+}
+
+/** `String(value)`, without throwing for values such as `Object.create(null)`. */
+function messageOf(value: unknown): string {
+	try {
+		return String(value);
+	} catch {
+		return "Unknown error";
+	}
 }
 
 const calls = new Map<number, AbortController>();
@@ -198,4 +209,16 @@ export function handle<T>(id: number): T {
 /** JSON without `undefined` fields; `null` for `undefined`. */
 export function plain<T>(value: T): Json {
 	return value === undefined ? null : (JSON.parse(JSON.stringify(value)) as Json);
+}
+
+/** The error a stream ends with for a watch's terminal result: a listener's error, or the one that failed the Session. */
+export function watchEndError(end: { reason: string; error?: unknown }): unknown {
+	if (end.reason === "listener_error") return end.error;
+	if (end.reason === "session_failed") {
+		const cause = end.error;
+		return Object.assign(new Error(`The session failed: ${cause instanceof Error ? cause.message : messageOf(cause)}`, { cause }), {
+			name: "SessionFailed",
+		});
+	}
+	return undefined;
 }

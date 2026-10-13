@@ -95,7 +95,7 @@ import Testing
     @Test func toolResultDiagnostics() async throws {
         let noisy = Tool("noisy", description: "Reports diagnostics") { call -> ToolResult in
             try await call.diagnostic(ToolDiagnostic("recorded while running", severity: .info, code: "running"))
-            return ToolResult(content: [.text("done")], diagnostics: [ToolDiagnostic("Output truncated", severity: .warn, code: "truncated")])
+            return ToolResult(output: [.text("done")], diagnostics: [ToolDiagnostic("Output truncated", severity: .warn, code: "truncated")])
         }
         let setup = try await FauxSetup.make(extensions: [Extension("noisy", tools: [noisy])])
         try await setup.faux.append(.toolCall("noisy", [:]))

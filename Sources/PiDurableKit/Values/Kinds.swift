@@ -91,3 +91,30 @@ public struct CompactionStatus: Decodable, Sendable, Hashable {
         retry = try? container.decodeIfPresent(RetryBackoff.self, forKey: .retry)
     }
 }
+
+/// The newest compaction that failed since a compaction last produced a summary (pi-durable `CompactionFailure`).
+public struct CompactionFailure: Decodable, Sendable, Hashable {
+    public let taskId: TaskID
+    public let reason: CompactionReason
+    /// The error message, or why the task was orphaned.
+    public let error: String
+}
+
+/// How a nested call ended (pi-durable `NestedToolSummary`).
+public struct NestedToolSummary: Decodable, Sendable, Hashable {
+    public let isError: Bool
+    public let duration: Duration?
+    public let usage: Usage?
+    /// Up to 500 characters of error text.
+    public let error: String?
+
+    private enum CodingKeys: String, CodingKey { case isError, durationMs, usage, error }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isError = try container.decodeIfPresent(Bool.self, forKey: .isError) ?? false
+        duration = try container.decodeIfPresent(Double.self, forKey: .durationMs).map { .milliseconds($0) }
+        usage = try? container.decodeIfPresent(Usage.self, forKey: .usage)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+    }
+}

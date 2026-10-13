@@ -51,5 +51,10 @@ export declare function summarizedMessages(view: ContextView, cut: number): Mess
  * every message.
  */
 export declare function estimateContext(view: ContextView, extra: readonly Message[]): number;
-/** Messages as plain text, so the summarizer reads a transcript instead of continuing it. System messages are omitted. */
+/**
+ * Messages as plain text, so the summarizer reads a transcript instead of continuing it. System messages are omitted.
+ * Thinking is omitted too: providers return summaries of the real reasoning, and replayed thinking is often not part of
+ * the live context (a block that does not match its request is dropped), so including it can make the request larger
+ * than the context it summarizes. Visible text, tool calls, and tool results record what happened.
+ */
 export declare function serializeConversation(messages: readonly Message[]): string;

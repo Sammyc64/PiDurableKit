@@ -77,7 +77,7 @@ public struct Storage: Sendable {
     }
 }
 
-/// Where tools such as ``Extension/codingTools(name:)`` read and write files and run commands (pi-durable
+/// Where tools such as ``Extension/codingTools(name:shell:images:)`` read and write files and run commands (pi-durable
 /// `HarnessOptions.env`).
 public struct ExecutionEnvironment: Sendable {
     enum Kind {

@@ -25,8 +25,12 @@ import Testing
         #expect(batches.count > 1)
         let events = batches.flatMap { $0 }
         #expect(events.contains { if case .runStart = $0 { true } else { false } })
-        #expect(events.contains { if case .toolExecutionStart(_, "get_weather", let args) = $0 { args["city"] == "Paris" } else { false } })
-        #expect(events.contains { if case .toolExecutionEnd(_, "get_weather", let entry?) = $0 { entry.kind == .toolResult } else { false } })
+        #expect(events.contains {
+            if case .toolExecutionStart(let call, let args) = $0 { call.toolName == "get_weather" && args["city"] == "Paris" } else { false }
+        })
+        #expect(events.contains {
+            if case .toolExecutionEnd(let call, let entry?, nil) = $0 { call.toolName == "get_weather" && call.taskId != nil && entry.kind == .toolResult } else { false }
+        })
 
         var streamed = ""
         for event in events {

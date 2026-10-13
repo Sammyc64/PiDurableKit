@@ -2,7 +2,7 @@
 // section, or one the host builds for a conversation, reached through handles.
 import type { Context } from "@earendil-works/chord";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import type { BinaryReader, DirReader, ExecutionEnv, Result, TextLineReader } from "@earendil-works/pi-durable/env";
+import type { BinaryReader, DirReader, ExecutionEnv, ListFilesOptions, Result, TextLineReader } from "@earendil-works/pi-durable/env";
 import { type Args, closeHandle, contextOf, emit, finish, handle, openHandle, openStream, register } from "./core.ts";
 import { fromBase64, toBase64 } from "./env.ts";
 import type { Scope } from "./scopes.ts";
@@ -73,6 +73,13 @@ register({
 	"env.exists": (args, context) => unwrap(envOf(args).exists(args.path, context)),
 	"env.fileInfo": (args, context) => unwrap(envOf(args).fileInfo(args.path, context)),
 	"env.listDir": (args, context) => unwrap(envOf(args).listDir(args.path, context)),
+	"env.listFiles": async (args, context) => {
+		const env = envOf(args);
+		if (env.listFiles === undefined) {
+			throw Object.assign(new Error("This environment cannot list files"), { name: "FileError", code: "not_supported", path: args.path });
+		}
+		return unwrap(env.listFiles(args.path, (args.options ?? undefined) as ListFilesOptions | undefined, context));
+	},
 	"env.readText": (args, context) => unwrap(envOf(args).readTextFile(args.path, context)),
 	"env.readTextLines": (args, context) =>
 		unwrap(envOf(args).readTextLines(args.path, args.maxLines == null ? undefined : { maxLines: args.maxLines }, context)),

@@ -12,6 +12,8 @@ export type GenerationCheckpoint = {
     compacted?: TaskId<CompactionResult>;
     /** Error text of the overflow that started `compacted`; checked once when `prepare` resumes. */
     overflow?: string;
+    /** Set when the blocking threshold started `compacted`; its outcome is checked once when `prepare` resumes. */
+    threshold?: true;
 } | {
     phase: "request";
     attempt: number;

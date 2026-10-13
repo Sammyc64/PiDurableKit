@@ -13,6 +13,7 @@ export declare class CommittedStateSource<T = ObservedDocumentValue> implements 
     constructor(value: T, release: () => void);
     attach(): ReplicatedStateSourceAttachment<T>;
     advance(value: T, ops: readonly Op[], context: Context): void;
+    /** Stop publishing; the attached states keep their last value. A failure ends them the same way. */
     closeSession(): void;
 }
 /**
@@ -21,14 +22,20 @@ export declare class CommittedStateSource<T = ObservedDocumentValue> implements 
  */
 export declare class CommittedWatch<T = ObservedDocumentValue> implements WatchHandle<T> {
     #private;
-    /** `replace` gives the value an overflow delivers; by default the newest value. */
-    constructor(value: T, detach: () => void, replace?: () => T);
+    /**
+     * `report` gets a listener's throw, which also ends the watch. `replace` gives the value an overflow delivers; by
+     * default the newest value.
+     */
+    constructor(value: T, detach: () => void, report: (error: unknown) => void, replace?: () => T);
     get value(): T;
     get closed(): Promise<WatchEnd>;
     start(listener: (value: T, ops: readonly Op[], context: Context) => Promise<void>): void;
     stop(): Promise<WatchEnd>;
     observeCancellation(signal: AbortSignal): void;
     cancel(): void;
-    closeSession(): void;
+    /** End with `session_closed`, or with `session_failed` and the error when the Session failed. */
+    closeSession(failure?: {
+        readonly error: unknown;
+    }): void;
     advance(value: T, ops: readonly Op[], context: Context): void;
 }

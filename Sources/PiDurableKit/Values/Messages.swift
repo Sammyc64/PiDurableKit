@@ -144,6 +144,15 @@ public struct ToolCall: Codable, Sendable, Hashable, Identifiable {
     public var id: String
     public var name: String
     public var arguments: JSONObject
+    /// For a nested call, one a running tool made with ``ToolCallContext/executeTool(_:arguments:key:progress:)-(_,JSONObject,_,_)``:
+    /// the calling tool call, as tool hooks see it (pi-durable `ToolHookCall.parent`).
+    public var parent: Parent?
+
+    /// The tool call that made a nested call.
+    public struct Parent: Codable, Sendable, Hashable {
+        public var taskId: TaskID
+        public var callId: String
+    }
 
     public init(id: String, name: String, arguments: JSONObject) {
         self.id = id
@@ -151,13 +160,14 @@ public struct ToolCall: Codable, Sendable, Hashable, Identifiable {
         self.arguments = arguments
     }
 
-    private enum CodingKeys: String, CodingKey { case type, id, name, arguments }
+    private enum CodingKeys: String, CodingKey { case type, id, name, arguments, parent }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
         name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
         arguments = (try? container.decodeIfPresent(JSONObject.self, forKey: .arguments)) ?? [:]
+        parent = try? container.decodeIfPresent(Parent.self, forKey: .parent)
     }
 
     /// Decodes the arguments as `T`.

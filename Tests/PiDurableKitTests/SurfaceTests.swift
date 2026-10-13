@@ -43,7 +43,7 @@ import Testing
             "type": "tool_execution_update", "toolCallId": "c", "toolName": "t",
             "diagnostics": [["severity": "info", "message": "spilled"]],
         ] as JSONValue).decode(as: AgentEvent.self)
-        guard case .toolExecutionUpdate(_, _, _, _, let diagnostics) = update else {
+        guard case .toolExecutionUpdate(_, _, _, let diagnostics) = update else {
             Issue.record("Expected a tool update, got \(update)")
             return
         }
@@ -580,7 +580,7 @@ import Testing
     }
 
     @Test func codingToolsWithShell() async throws {
-        #expect(Extension.codingTools(shell: true).builtin?.count == 4)
+        #expect(Extension.codingTools(shell: true).builtin?.tools.count == 4)
     }
     #endif
 }

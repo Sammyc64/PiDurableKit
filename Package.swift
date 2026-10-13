@@ -17,6 +17,7 @@ let package = Package(
             name: "PiDurableKit",
             resources: [
                 .copy("Resources/pi-durable.js"), .copy("Resources/Documentation"), .copy("Resources/ThirdPartyNotices.txt"),
+                .copy("Resources/quickjs.wasm"),
             ],
             linkerSettings: [.linkedLibrary("sqlite3")]
         ),

@@ -36,7 +36,8 @@ function dependencyVersion(name) {
 
 const piAI = dependencyVersion("@earendil-works/pi-ai");
 const chord = dependencyVersion("@earendil-works/chord");
-console.error(`Updating pi-durable ${previous} → ${version} (pi-ai ${piAI}, chord ${chord})`);
+const codemode = dependencyVersion("@earendil-works/pi-codemode");
+console.error(`Updating pi-durable ${previous} → ${version} (pi-ai ${piAI}, chord ${chord}, pi-codemode ${codemode})`);
 
 run("npm", [
 	"install",
@@ -44,10 +45,15 @@ run("npm", [
 	`@earendil-works/pi-durable@${version}`,
 	`@earendil-works/pi-ai@${piAI}`,
 	`@earendil-works/chord@${chord}`,
+	`@earendil-works/pi-codemode@${codemode}`,
 ], { stdio: ["ignore", "inherit", "inherit"] });
 run("npm", ["run", "build"], { stdio: ["ignore", "inherit", "inherit"] });
 
-const changed = previous !== version || installed["@earendil-works/pi-ai"] !== piAI || installed["@earendil-works/chord"] !== chord;
+const changed =
+	previous !== version ||
+	installed["@earendil-works/pi-ai"] !== piAI ||
+	installed["@earendil-works/chord"] !== chord ||
+	installed["@earendil-works/pi-codemode"] !== codemode;
 const output = `changed=${changed}\nversion=${version}\nprevious=${previous}\n`;
 process.stdout.write(output);
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, output);

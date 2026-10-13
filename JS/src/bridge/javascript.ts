@@ -6,6 +6,9 @@ import * as piAI from "@earendil-works/pi-ai";
 import * as piDurable from "@earendil-works/pi-durable";
 import * as piDurableEnv from "@earendil-works/pi-durable/env";
 import * as piDurableTools from "@earendil-works/pi-durable/tools";
+import * as piDurableToolSearch from "@earendil-works/pi-durable/tool-search";
+import * as piDurableCodemode from "@earendil-works/pi-durable/codemode";
+import * as piCodemode from "@earendil-works/pi-codemode/portable";
 import type { Extension } from "@earendil-works/pi-durable";
 
 /** The packages an extension may `require`. */
@@ -13,6 +16,9 @@ const modules: Record<string, unknown> = {
 	"@earendil-works/pi-durable": piDurable,
 	"@earendil-works/pi-durable/tools": piDurableTools,
 	"@earendil-works/pi-durable/env": piDurableEnv,
+	"@earendil-works/pi-durable/tool-search": piDurableToolSearch,
+	"@earendil-works/pi-durable/codemode": piDurableCodemode,
+	"@earendil-works/pi-codemode/portable": piCodemode,
 	"@earendil-works/pi-ai": piAI,
 	"@earendil-works/chord/context": chordContext,
 };

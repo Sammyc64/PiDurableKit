@@ -6,8 +6,14 @@ public enum PiDurableError: Error, Sendable, LocalizedError, CustomStringConvert
     case conversationBusy(ConversationID)
     /// A transaction read a table (conversations, entries, tasks) after its first table write. Read first, then write.
     case readAfterWrite(String)
-    /// Storage rejected a commit before any durable effect; the harness can continue.
-    case storageRejected(String)
+    /// The session failed, so nothing runs or commits any more (pi-durable `SessionFailed`): usually because a storage
+    /// call threw, which fails the session and closes it. `cause` is that first error's message. Reopen the harness;
+    /// reopening recovers from what was committed.
+    case sessionFailed(message: String, cause: String?)
+    /// A storage read rejected an invalid request, such as an unknown conversation or a cursor of another scan, with no
+    /// durable effect (pi-durable `StorageRequestError`). Unlike any other storage error, it fails only that call. A
+    /// ``CustomStorage`` throws it for invalid reads.
+    case storageRequestError(String)
     /// JSONL storage found a damaged file (pi-durable `JsonlCorruptionError`).
     case jsonlCorrupted(String)
     /// JSONL storage failed in a way that leaves its state uncertain; reopen it (pi-durable `JsonlStoragePoisonedError`).
@@ -36,7 +42,8 @@ public enum PiDurableError: Error, Sendable, LocalizedError, CustomStringConvert
         switch self {
         case .conversationBusy(let id): "Conversation \(id) is busy"
         case .readAfterWrite(let message): message
-        case .storageRejected(let message): "Storage rejected the commit: \(message)"
+        case .sessionFailed(let message, let cause): cause.map { "\(message): \($0)" } ?? message
+        case .storageRequestError(let message): message
         case .jsonlCorrupted(let message): "JSONL storage is corrupted: \(message)"
         case .jsonlPoisoned(let message): message
         case .file(_, let message, _): message
@@ -52,6 +59,11 @@ public enum PiDurableError: Error, Sendable, LocalizedError, CustomStringConvert
 
     init(javaScriptJSON json: String) {
         struct Info: Decodable {
+            struct Cause: Decodable {
+                var name: String?
+                var message: String?
+            }
+
             var name: String?
             var message: String?
             var stack: String?
@@ -59,6 +71,7 @@ public enum PiDurableError: Error, Sendable, LocalizedError, CustomStringConvert
             var conversationId: Int?
             var path: String?
             var spillPath: String?
+            var cause: Cause?
         }
         let info = (try? JSONDecoder().decode(Info.self, from: Data(json.utf8))) ?? Info(message: json)
         let name = info.name ?? "Error"
@@ -67,7 +80,8 @@ public enum PiDurableError: Error, Sendable, LocalizedError, CustomStringConvert
         switch name {
         case "ConversationBusy": self = .conversationBusy(ConversationID(info.conversationId ?? 0))
         case "ReadAfterWrite": self = .readAfterWrite(message)
-        case "StorageRejected": self = .storageRejected(message)
+        case "SessionFailed": self = .sessionFailed(message: message, cause: info.cause?.message)
+        case "StorageRequestError": self = .storageRequestError(message)
         case "JsonlCorruptionError": self = .jsonlCorrupted(message)
         case "JsonlStoragePoisonedError": self = .jsonlPoisoned(message)
         case "FileError": self = .file(code: code ?? "unknown", message: message, path: info.path)

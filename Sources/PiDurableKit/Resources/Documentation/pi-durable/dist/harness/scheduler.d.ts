@@ -44,8 +44,14 @@ export type TaskSchedulerOptions = {
  * commit listener updates it on the Session line, so code running on the line reads exactly the committed state from it.
  *
  * Tasks and conversations form one ownership tree (spec §5.5): a task's parent is its owner task, or its conversation;
- * a conversation's parent is its owner task, if any. Walks up that tree decide cascades, idle scopes, and whether a
- * task's ordinary owned work is live, which holds its outcome as `completing` and delays its abort handler.
+ * a conversation's parent is its owner task, if any. Walks up that tree decide what reaches one task: a cancelling
+ * owner, a scope. `#below` lists the tree downward around live work, so what lies below one node is a walk down from
+ * it: a task's live ordinary owned work, which holds its outcome as `completing` and delays its abort handler, a
+ * scope's tasks, a cascade's reach. No pass visits every live task; the sets below hold each pass's candidates.
+ *
+ * The ownership indexes are bounded by live work: an owner edge and an ended task's ownership fields are kept only while
+ * something is listed below them in `#below`, so only the chains above live tasks are known, whole. Work that appears
+ * later below a dropped node finds it unknown and loads its chain from storage again.
  *
  * Invariant: every task transition is decided and written by one callback serialized on the Session line. That covers
  * reservation, marks, runtime commits, finalization, and the synchronous step before each phase, which applies the
@@ -59,14 +65,19 @@ export declare class TaskScheduler {
     open(context: Context): Promise<void>;
     /** Enable scheduling. Idempotent; the kick does nothing once closing. */
     resume(): void;
-    /** Wait for every invocation signalled by `#seal()`. Writes nothing. */
+    /**
+     * Signal every invocation and wait for them; writes nothing. Close calls this after every close listener has run, so
+     * waits, watches, and streams a task holds end with the Session's reason, not as cancelled by its signal.
+     */
     join(): Promise<void>;
     /**
      * Commit the abort mark, or settle a task that no registered definition can take as `orphaned` when nothing it owns
      * is live, then join the run invocation seen on the line; the commit listener signalled it. The abort invocation
-     * starts once the task's ordinary owned work is gone. A `completing` task is only marked.
+     * starts once the task's ordinary owned work is gone. A `completing` task is only marked. A request replaces a
+     * `restart` mark, so a task abandoned after a restart that waits for its definition is orphaned; with `keepRestart`,
+     * as for an owner's own cleanup, such a task keeps its mark and waits on.
      */
-    abort(id: TaskId, context: Context): Promise<"marked" | "terminal">;
+    abort(id: TaskId, context: Context, keepRestart?: boolean): Promise<"marked" | "terminal">;
     waitForTask(id: TaskId, context: Context): Promise<SettledTask<JsonValue>>;
     /**
      * Resolve when ordinary traversal from the conversation, or from every ownerless conversation, reaches no live
@@ -79,6 +90,8 @@ export declare class TaskScheduler {
      * crosses background boundaries, and the wait also covers every task it reached.
      */
     abortConversation(conversationId: ConversationId, background: boolean, context: Context): Promise<void>;
+    /** Sizes of the ownership indexes, for tests that bound the scheduler's memory. */
+    get indexSizes(): Readonly<Record<"live" | "settled" | "edges" | "below" | "roots" | "unloaded" | "dropQueue", number>>;
     /**
      * Scheduling state and every live task with its derived state, read on the Session line. Runs no task code: a
      * pending migration shows as `ready` with `migrates`, and only a migration the scheduler already tried, or one that

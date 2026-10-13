@@ -37,7 +37,7 @@ public protocol TaskCheckpoint: Codable, Sendable {
 /// ```
 ///
 /// Install task types in an ``Extension``, then create tasks in a commit with
-/// ``Transaction/createTask(_:input:in:ownedBy:background:)``. A phase runs again from its checkpoint after a crash, so it
+/// ``Transaction/createTask(_:input:in:ownedBy:background:abandonOnRestart:)``. A phase runs again from its checkpoint after a crash, so it
 /// must be safe to repeat up to its commit; ``TaskRun/memo(_:default:)`` keeps values stable across reruns.
 public struct TaskType<Input: Codable & Sendable, Checkpoint: TaskCheckpoint, Result: Codable & Sendable>: Sendable {
     public typealias Handler = @Sendable (TaskRun<Input, Checkpoint, Result>) async throws -> Void
@@ -256,6 +256,17 @@ public struct TaskRun<Input: Codable & Sendable, Checkpoint: TaskCheckpoint, Res
         try await handle.call("scope.waitForTask", ["task": id])
     }
 
+    /// The live tasks this task owns directly, in ID order, including those an earlier invocation created before a
+    /// restart (pi-durable `runtime.ownedTasks()`).
+    public func ownedTasks() async throws -> [TaskRecord] {
+        try await handle.call("scope.ownedTasks")
+    }
+
+    /// Aborts a task this task owns and waits until it is terminal (pi-durable `runtime.abortOwned()`).
+    public func abortOwned(_ task: TaskID) async throws {
+        try await handle.perform("scope.abortOwned", ["task": task])
+    }
+
     /// A handle to an existing conversation, such as one this task owns.
     public func conversation(_ id: ConversationID) async throws -> ConversationHandle? {
         try await handle.conversation(id, harness: harness)
@@ -373,6 +384,11 @@ public struct TaskRecord: Decodable, Sendable, Hashable, Identifiable {
     public let owner: TaskID?
     public let background: Bool
     public let abortRequested: Bool
+    /// Why the abort mark was set when not by an abort request: `restart` for a task abandoned after a restart
+    /// (``Transaction/createTask(_:input:in:ownedBy:background:abandonOnRestart:)``) or below one.
+    public let abortReason: String?
+    /// Whether the task is aborted when a later harness starts scheduling, since its creator awaits it only in memory.
+    public let abandonOnRestart: Bool
     /// When the task first started running; `nil` for records written before pi-durable 1.1.
     public let startedAt: Date?
     /// When the task became terminal.
@@ -403,7 +419,8 @@ public struct TaskRecord: Decodable, Sendable, Hashable, Identifiable {
     private let rawOutcome: JSONValue?
 
     private enum CodingKeys: String, CodingKey {
-        case id, conversationId, kind, version, input, owner, background, abortRequested, state, startedAt, endedAt
+        case id, conversationId, kind, version, input, owner, background, abortRequested, abortReason, abandonOnRestart, state
+        case startedAt, endedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -416,6 +433,8 @@ public struct TaskRecord: Decodable, Sendable, Hashable, Identifiable {
         owner = try container.decodeIfPresent(TaskID.self, forKey: .owner)
         background = try container.decodeIfPresent(Bool.self, forKey: .background) ?? false
         abortRequested = try container.decodeIfPresent(Bool.self, forKey: .abortRequested) ?? false
+        abortReason = try container.decodeIfPresent(String.self, forKey: .abortReason)
+        abandonOnRestart = try container.decodeIfPresent(Bool.self, forKey: .abandonOnRestart) ?? false
         startedAt = try container.decodeIfPresent(Double.self, forKey: .startedAt).map { Date(timeIntervalSince1970: $0 / 1000) }
         endedAt = try container.decodeIfPresent(Double.self, forKey: .endedAt).map { Date(timeIntervalSince1970: $0 / 1000) }
         let state = try container.decode(JSONValue.self, forKey: .state)

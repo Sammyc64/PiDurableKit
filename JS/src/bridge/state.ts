@@ -37,6 +37,9 @@ export type HarnessState = {
 
 export const harnesses = new Map<number, HarnessState>();
 
+/** How each opened harness or session ended, kept after it closed so a late caller still learns why. */
+export const endings = new Map<number, Promise<{ reason: "closed" } | { reason: "failed"; error: unknown }>>();
+
 export function harnessState(id: number): HarnessState {
 	const state = harnesses.get(id);
 	if (state === undefined) throw new Error("The harness is closed");
@@ -79,6 +82,15 @@ export function agentChange(state: HarnessState, change: Args | undefined | null
 		const value = change.tools;
 		result.tools = value === null ? null : Array.isArray(value) ? value.map(tool) : { remove: value.remove.map(tool) };
 	}
+	if ("modelTools" in change) {
+		const value = change.modelTools;
+		result.modelTools =
+			value === null
+				? null
+				: Array.isArray(value)
+					? value.map(tool)
+					: { ...(value.remove ? { remove: value.remove.map(tool) } : {}), ...(value.add ? { add: value.add.map(tool) } : {}) };
+	}
 	return result as AgentChange;
 }
 
@@ -88,6 +100,8 @@ export function describeAgent(agent: Agent) {
 		thinkingLevel: agent.thinkingLevel,
 		extensions: agent.extensions.map((extension) => extension.name),
 		tools: agent.tools.map((tool) => tool.name),
+		callable: agent.callable.map((tool) => tool.name),
+		deferred: agent.deferred.map((tool) => tool.name),
 		sections: agent.sections.map((section) => ({ key: section.key, tag: section.tag !== false })),
 		instructions: agent.instructions ?? null,
 		cwd: agent.cwd ?? null,
@@ -105,6 +119,9 @@ export function describeRegistry(snapshot: RegistrySnapshot) {
 				parameters: tool.parameters,
 				replay: tool.replay ?? "unsafe",
 				executionMode: tool.executionMode ?? null,
+				structuredOutputSchema: tool.structuredOutputSchema ?? null,
+				callers: tool.callers ?? ["model", "tools"],
+				deferred: tool.deferred === true,
 			})),
 			sections: (extension.sections ?? []).map((section) => ({ key: section.key, tag: section.tag !== false })),
 			hooks: (extension.hooks ?? []).map((hook) => hook.task),
@@ -136,6 +153,7 @@ export function resolveSettings(settings: HarnessSettings): Settings {
 		steeringMode: settings.steeringMode ?? "one-at-a-time",
 		followUpMode: settings.followUpMode ?? "one-at-a-time",
 		contextRetentionMs: settings.contextRetentionMs ?? 600_000,
+		documentRetentionMs: settings.documentRetentionMs ?? 600_000,
 	};
 }
 

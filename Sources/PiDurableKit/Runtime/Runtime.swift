@@ -237,6 +237,8 @@ actor Engine {
                 info["path"] = path
             case .execution(let code, _, _)?:
                 info["code"] = code
+            case .storageRequestError?:
+                info["code"] = "storage_request"
             default: break
             }
             let json = (try? String(decoding: JSONEncoder().encode(info), as: UTF8.self)) ?? "{}"
