@@ -224,11 +224,12 @@ loaded with `AgentChange(modelTools: .edit(add: […]))` or `Extension.toolSearc
 
 `Extension.codemode()` adds pi-durable's durable code mode: a `codemode` tool whose JavaScript scripts call the
 conversation's tools (`await tools.forecast({ city: "Oslo" })`) as nested calls, in a QuickJS sandbox bundled as
-WebAssembly. A script survives a restart: it replays from a journal of the results it got and continues. Scripts run
-on the runtime's JavaScript thread, so one that computes without awaiting a tool holds up the runtime until its interrupt
-budget runs out: about 40 seconds by default on an iPhone 18 Pro, so apps may want a lower `interruptBudget`. It works
-on iOS devices; QuickJS computes slowly there as on a Mac (a 5-million-step loop takes about 4 seconds), and a script
-that mostly calls tools adds little (about 0.1 seconds).
+WebAssembly. A script survives a restart: it replays from a journal of the results it got and continues. Each script
+runs in a JavaScriptCore context on a thread of its own, so one that computes doesn't hold up the runtime; its tools
+still run in the runtime. It works on iOS devices. QuickJS computes slowly there as on a Mac (a 5-million-step loop
+takes about 4 seconds), and a script that mostly calls tools adds little (about 0.1 seconds). `interruptBudget` bounds
+how long a script computes without calling a tool (by default about 40 seconds on an iPhone 18 Pro), and
+`memoryLimitBytes` how much memory it allocates.
 
 `harness.commit { tx in … }` and `conversation.commit { tx in … }` run any set of reads and writes atomically: create
 conversations and forks, append entries, create tasks, configure agents, and read or write documents. Throwing rolls
@@ -600,6 +601,7 @@ let root = try await harness.root(agent: AgentChange(model: faux.model))
 | pi-durable `ExecutionEnv` (sandbox files) | POSIX file calls on the sandbox's real directory |
 | `Shell.exec` (macOS `.local`, `.directory(_:shell:)`) | `posix_spawn` in its own process group |
 | `WebAssembly.compile`, `instantiate` (code mode's QuickJS) | JavaScriptCore's synchronous `WebAssembly.Module` (its promise APIs need a run loop) |
+| A worker thread for code mode's VM | A second JavaScriptCore context on its own queue, as pi-codemode's `RemoteCodemodeSandbox` remote |
 | pi-durable `ImageProcessor` | ImageIO (`NativeImageProcessor`) |
 
 `TextEncoder`/`TextDecoder`, `AbortController`, `EventTarget`, `Blob`/`FormData`, and `Headers`/`Request`/`Response` are implemented in TypeScript; `ReadableStream` comes from `web-streams-polyfill` and newer ECMAScript built-ins from `core-js`. All JavaScript runs on one serial queue per `Runtime`, which is also the executor of the actor that owns the `JSContext`. Swift and JavaScript talk through a small JSON bridge (`JS/src/bridge/`).

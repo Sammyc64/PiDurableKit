@@ -30,8 +30,11 @@ import {
 	type ImageProcessor,
 	type PreparedImage,
 } from "@earendil-works/pi-durable/tools";
-import { InlineCodemodeSandbox } from "@earendil-works/pi-codemode/portable";
-import { native } from "../runtime/native.ts";
+import {
+	type CodemodeRemoteExchange,
+	type CodemodeRemoteRequest,
+	RemoteCodemodeSandbox,
+} from "@earendil-works/pi-codemode/portable";
 import { type Args, handle, host, hostSync, register } from "./core.ts";
 import { fromBase64, toBase64 } from "./env.ts";
 import { evaluateExtension } from "./javascript.ts";
@@ -40,17 +43,35 @@ import { describeAgent, describeTask, type HarnessState } from "./state.ts";
 
 type Next = { next: (input?: unknown) => Promise<unknown> };
 
-/** QuickJS for code mode, compiled once per runtime. */
-const quickJSModules = new Map<string, Promise<object>>();
-function quickJS(path: string): Promise<object> {
-	let compiled = quickJSModules.get(path);
-	if (compiled === undefined) {
-		compiled = WebAssembly.compile(native.fsReadFile(path) as BufferSource);
-		quickJSModules.set(path, compiled);
-		compiled.catch(() => quickJSModules.delete(path));
-	}
-	return compiled;
+/**
+ * Code mode's executions, by number: each runs its QuickJS VM in a worker of its own (`CodemodeWorkers` in Swift), on
+ * another thread, so a script that computes doesn't hold up this one. Swift passes each exchange of messages back here.
+ */
+let nextExecution = 1;
+const executions = new Map<number, CodemodeRemoteExchange>();
+
+function workerRemote(wasmPath: string) {
+	return {
+		async execute(request: CodemodeRemoteRequest, exchange: CodemodeRemoteExchange): Promise<void> {
+			const execution = nextExecution++;
+			executions.set(execution, exchange);
+			try {
+				await host("codemode.execute", { execution, request: JSON.stringify(request), wasmPath });
+			} finally {
+				executions.delete(execution);
+			}
+		},
+	};
 }
+
+register({
+	/** One exchange of an execution: the worker's messages in, the reply out (`{ type: "stop" }` once it has ended). */
+	"codemode.exchange": async (args: Args) => {
+		const exchange = executions.get(args.execution as number);
+		if (exchange === undefined) return { type: "stop" };
+		return (await exchange(JSON.parse(args.messages as string))) ?? null;
+	},
+});
 
 /** pi-durable's `ImageProcessor` for `read`, implemented in Swift (`ImageProcessor`, ImageIO by default). */
 function hostImages(state: HarnessState, extension: string, index: number): ImageProcessor {
@@ -76,10 +97,10 @@ export function buildExtension(state: HarnessState, spec: Args): Extension {
 
 	if (spec.builtin === "toolSearch") return defineExtension({ ...createToolSearchExtension(), name });
 	if (spec.builtin === "codemode") {
-		const sandbox = new InlineCodemodeSandbox({
-			// QuickJS, compiled once per runtime from the copy Swift bundles.
-			wasm: quickJS(spec.wasmPath),
+		const sandbox = new RemoteCodemodeSandbox({
+			remote: () => workerRemote(spec.wasmPath as string),
 			...(spec.interruptBudget == null ? {} : { interruptBudget: spec.interruptBudget }),
+			...(spec.memoryLimitBytes == null ? {} : { memoryLimitBytes: spec.memoryLimitBytes }),
 		});
 		return defineExtension({
 			...createCodemodeExtension({

@@ -140,6 +140,31 @@ const result = await build({
 });
 
 /**
+ * The code mode worker: a second, small bundle that runs code mode's QuickJS VMs in a JavaScriptCore context on another
+ * thread (`CodemodeWorkers` in Swift). Its packages are all in the main bundle too, so the notices cover it.
+ */
+const worker = await build({
+	entryPoints: [resolve(root, "src/worker/index.ts")],
+	outfile: resolve(root, "../Sources/PiDurableKit/Resources/codemode-worker.js"),
+	bundle: true,
+	format: "iife",
+	platform: "browser",
+	target: ["safari16"],
+	minify: !process.argv.includes("--no-minify"),
+	keepNames: true,
+	legalComments: "none",
+	charset: "utf8",
+	metafile: true,
+	logLevel: "warning",
+	banner: { js: `/* PiDurableKit code mode worker: pi-codemode ${versions.piCodemode} */` },
+});
+for (const input of Object.keys(worker.metafile.inputs)) {
+	if (!(input in result.metafile.inputs) && !input.startsWith("src/")) {
+		throw new Error(`The code mode worker bundles ${input}, which the main bundle doesn't; add its notice`);
+	}
+}
+
+/**
  * The license notices of every npm package with code in the bundle, found from esbuild's metafile, so apps that ship
  * the bundle also ship the notices its licenses require (MIT, Apache-2.0, …), including Apache `NOTICE` files.
  */

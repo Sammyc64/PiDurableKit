@@ -149,9 +149,9 @@ public struct Extension: Sendable, Identifiable {
     /// call the conversation's tools as nested calls and survive a restart, and a `codemode` prompt section listing the
     /// tools scripts can call.
     ///
-    /// Scripts run in QuickJS (WebAssembly) on the runtime's JavaScript thread: while a script computes without
-    /// awaiting a tool, the runtime's other work waits, up to `interruptBudget`. JavaScriptCore runs WebAssembly on
-    /// macOS, iOS devices, and the iOS Simulator.
+    /// Scripts run in QuickJS (WebAssembly), each in a JavaScriptCore context on a thread of its own, so one that
+    /// computes doesn't hold up the runtime's other work; tools still run in the runtime. JavaScriptCore runs
+    /// WebAssembly on macOS, iOS devices, and the iOS Simulator.
     public static func codemode(name: String = "codemode", _ options: CodemodeOptions = CodemodeOptions()) -> Extension {
         Extension(builtin: .codemode(options), name: name)
     }
@@ -170,6 +170,7 @@ public struct Extension: Sendable, Identifiable {
                 "name": name, "builtin": "codemode", "wasmPath": CodemodeOptions.quickJSPath,
                 "namespaces": options.namespaces.isEmpty ? nil : options.namespaces, "inlineBudget": options.inlineBudget,
                 "models": options.models, "interruptBudget": options.interruptBudget,
+                "memoryLimitBytes": options.memoryLimitBytes,
             ]
         case nil: break
         }
@@ -637,15 +638,24 @@ public struct CodemodeOptions: Sendable {
     /// Give scripts `models.*`: the model catalog, classifiers, and image generation; default `true`.
     public var models: Bool?
     /// Interrupt polls a script may use computing without awaiting a tool before it fails as timed out; default
-    /// 100,000. On an iPhone 18 Pro, 100,000 is about 40 seconds and 10,000 about 4, during which the runtime's other
-    /// JavaScript work waits.
+    /// 100,000. On an iPhone 18 Pro, 100,000 is about 40 seconds of computing and 10,000 about 4. A script that ends
+    /// otherwise (its deadline passed, or its run was stopped) computes on until its next tool call or the end of this
+    /// budget, on its own thread.
     public var interruptBudget: Int?
+    /// The most memory a script's VM may allocate, in bytes; past it, allocations fail inside the script as
+    /// `InternalError: out of memory`. Default: no limit short of WebAssembly's 4 GiB, which on an iPhone is more than
+    /// iOS lets an app use.
+    public var memoryLimitBytes: Int?
 
-    public init(namespaces: [Namespace] = [], inlineBudget: Int? = nil, models: Bool? = nil, interruptBudget: Int? = nil) {
+    public init(
+        namespaces: [Namespace] = [], inlineBudget: Int? = nil, models: Bool? = nil, interruptBudget: Int? = nil,
+        memoryLimitBytes: Int? = nil
+    ) {
         self.namespaces = namespaces
         self.inlineBudget = inlineBudget
         self.models = models
         self.interruptBudget = interruptBudget
+        self.memoryLimitBytes = memoryLimitBytes
     }
 
     /// The bundled `quickjs.wasm`.

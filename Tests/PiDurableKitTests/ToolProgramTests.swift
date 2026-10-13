@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import Testing
+import os
 import UniformTypeIdentifiers
 @testable import PiDurableKit
 
@@ -176,6 +177,98 @@ private struct Forecast: Codable, Sendable, Equatable {
         #expect(result.isError == false, "\(result.text)")
         #expect(result.text.contains("echo a | echo b"))
         #expect(result.details?["calls"]?.arrayValue?.count == 2)
+    }
+}
+
+/// Code mode's VMs run in workers, each on a thread of its own.
+@Suite struct CodemodeWorkerTests {
+    @Test func aComputingScriptLeavesTheRuntimeFree() async throws {
+        let setup = try await FauxSetup.make(extensions: [.codemode(CodemodeOptions(models: false))])
+        try await setup.faux.append(.toolCall("codemode", ["code": .string("let s = 0; for (let i = 0; i < 3e6; i++) s += i % 7; return s")]))
+        try await setup.faux.append(.text("done"))
+        let root = try await setup.root()
+        let started = ContinuousClock.now
+        let submission = try await root.submit("Compute")
+        try await Task.sleep(for: .milliseconds(300))
+        // The runtime answers while the script computes.
+        let answered = try await ContinuousClock().measure { _ = try await Runtime.shared.bundledVersions() }
+        #expect(answered < .milliseconds(200), "The runtime waited \(answered) for the script")
+        _ = try await withTimeout(60) { try await submission.wait() }
+        #expect(ContinuousClock.now - started > answered + .milliseconds(300))
+        let result = try #require(try await root.view().entries.compactMap(\.toolResult).first)
+        #expect(result.isError == false, "\(result.text)")
+        #expect(result.text.contains("8999994"))
+    }
+
+    @Test func scriptsRunConcurrently() async throws {
+        let echo = Tool("echo", description: "Echo a word", parameters: .object(["word": .string("The word")])) { (args: Word, _) in
+            "echo \(args.word)"
+        }
+        let setup = try await FauxSetup.make(extensions: [Extension("echo", tools: [echo]), .codemode(CodemodeOptions(models: false))])
+        var conversations: [Conversation] = []
+        for _ in 0..<4 {
+            conversations.append(try await setup.harness.createConversation(agent: AgentChange(model: setup.faux.model)))
+        }
+        for _ in conversations {
+            try await setup.faux.append(.toolCall("codemode", ["code": .string(#"return (await Promise.all(["x", "y"].map((word) => tools.echo({ word })))).join(",")"#)]))
+        }
+        for _ in conversations { try await setup.faux.append(.text("done")) }
+        let submissions = try await withThrowingTaskGroup(of: Submission.self) { group in
+            for conversation in conversations { group.addTask { try await conversation.submit("Script") } }
+            return try await group.reduce(into: []) { $0.append($1) }
+        }
+        for submission in submissions { _ = try await withTimeout(30) { try await submission.wait() } }
+        for conversation in conversations {
+            let result = try #require(try await conversation.view().entries.compactMap(\.toolResult).first)
+            #expect(result.text.contains("echo x,echo y"), "\(result.text)")
+        }
+    }
+
+    @Test func memoryLimit() async throws {
+        let setup = try await FauxSetup.make(extensions: [.codemode(CodemodeOptions(models: false, memoryLimitBytes: 16 << 20))])
+        try await setup.faux.append(.toolCall("codemode", ["code": .string("const parts = []; for (let i = 0; i < 64; i++) parts.push(new Uint8Array(1 << 20)); return parts.length")]))
+        try await setup.faux.append(.text("done"))
+        let root = try await setup.root()
+        _ = try await withTimeout(30) { try await ask(root, "Allocate") }
+        let result = try #require(try await root.view().entries.compactMap(\.toolResult).first)
+        #expect(result.isError)
+        #expect(result.text.contains("out of memory"), "\(result.text)")
+    }
+
+    @Test func aScriptResumesAfterARestart() async throws {
+        let runs = OSAllocatedUnfairLock<[String]>(initialState: [])
+        let echo = Tool("echo", description: "Echo a word", parameters: .object(["word": .string("The word")])) { (args: Word, _) in
+            runs.withLock { $0.append(args.word) }
+            return "echo \(args.word)"
+        }
+        let slow = Tool("slow", description: "Takes a second", replay: .safe) { _ -> String in
+            runs.withLock { $0.append("slow") }
+            try await Task.sleep(for: .seconds(1))
+            return "slow done"
+        }
+        let url = temporaryDirectory().appending(path: "codemode.sqlite")
+        let models = Models(builtinProviders: false)
+        let faux = FauxProvider()
+        try await models.register(faux)
+        let extensions = [Extension("tools", tools: [echo, slow]), .codemode(CodemodeOptions(models: false))]
+        var harness = try await Harness.open(.sqlite(at: url), models: models, extensions: extensions)
+        let script = #"const a = await tools.echo({ word: "before" }); const b = await tools.slow({}); return [a, b, await tools.echo({ word: "after" })].join(" / ")"#
+        try await faux.append(.toolCall("codemode", ["code": .string(script)]))
+        try await faux.append(.text("done"))
+        let root = try await harness.root(agent: AgentChange(model: faux.model))
+        _ = try await root.submit("Script")
+        try await Task.sleep(for: .milliseconds(500))
+        try await harness.close()
+
+        harness = try await Harness.open(.sqlite(at: url), models: models, extensions: extensions)
+        let reopened = try await harness.root()
+        try await withTimeout(30) { try await reopened.waitForIdle() }
+        let result = try #require(try await reopened.view().entries.compactMap(\.toolResult).last)
+        #expect(result.isError == false, "\(result.text)")
+        #expect(result.text.contains("echo before / slow done / echo after"))
+        // The finished call wasn't made again; the interrupted one, safe to replay, was.
+        #expect(runs.withLock { $0 } == ["before", "slow", "slow", "after"])
+        try await harness.close()
     }
 }
 

@@ -47,6 +47,13 @@ final class HostRouter: Sendable {
 
     private let state = OSAllocatedUnfairLock(initialState: State())
     private let engineReference = OSAllocatedUnfairLock<WeakEngine>(initialState: WeakEngine())
+    /// Code mode's VMs, each on a thread of its own.
+    private let codemodeWorkers: CodemodeWorkers
+
+    init() {
+        let engineReference = engineReference
+        codemodeWorkers = CodemodeWorkers { level, message in engineReference.withLock { $0.engine }?.log(level, message) }
+    }
 
     private struct WeakEngine: @unchecked Sendable {
         weak var engine: Engine?
@@ -199,6 +206,22 @@ final class HostRouter: Sendable {
         state.withLock { $0.documents[document.kind] = callbacks }
     }
 
+    // MARK: Code mode
+
+    /// Runs one code mode execution in a worker, passing each exchange of messages to the runtime's JavaScript.
+    private func executeCodemode(_ arguments: JSONValue) async throws -> JSONValue? {
+        let engine = try engine
+        let execution = arguments["execution"]?.intValue ?? 0
+        try await codemodeWorkers.execute(
+            request: arguments["request"]?.stringValue ?? "{}", wasmPath: arguments["wasmPath"]?.stringValue ?? ""
+        ) { [weak engine] messages in
+            guard let engine else { throw CancellationError() }
+            let reply = try await engine.callRaw("codemode.exchange", ["execution": execution, "messages": messages])
+            return String(decoding: reply, as: UTF8.self)
+        }
+        return nil
+    }
+
     // MARK: Dispatch
 
     func handle(method: String, arguments data: Data) async throws -> Data? {
@@ -241,6 +264,7 @@ final class HostRouter: Sendable {
             case "login.notify": loginNotify(arguments)
             case "env.custom": try await customEnvironment(arguments)
             case "foundationModels.respond": try await respondWithLanguageModel(arguments)
+            case "codemode.execute": try await executeCodemode(arguments)
             case "env.shell": try await shell(arguments)
             case "storage.custom": try await customStorage(arguments)
             case "conformance.storage", "conformance.environment": try await conformanceSubject(arguments)
