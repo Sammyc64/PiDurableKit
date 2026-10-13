@@ -536,8 +536,10 @@ thinking levels apply to models that reason (Private Cloud Compute).
   kept, none idle for over 15 minutes; `Settings.Stream(cacheRetention: "none")` starts every request fresh. Foundation
   Models reports no cached tokens for a request that ends at a tool call, though it reads the cache, and the iOS
   Simulator reports none at all.
-- **Limits.** Tools whose parameters Foundation Models cannot express (untyped properties) are not offered to these
-  models. Deferred requests don't apply. Private Cloud Compute needs Apple's entitlement in your app.
+- **Limits.** A tool whose parameters Foundation Models cannot express is not offered to these models: a parameter
+  without a `type` (`Type.Any()`, `Type.Unknown()`), with a list of types (`"type": ["string", "null"]`), or built
+  from `oneOf`/`allOf` (use `anyOf`). `minLength`, `format`, and `patternProperties` are ignored. Deferred requests
+  don't apply. Private Cloud Compute needs Apple's entitlement in your app.
 
 ### Signing in with a subscription (OAuth)
 
