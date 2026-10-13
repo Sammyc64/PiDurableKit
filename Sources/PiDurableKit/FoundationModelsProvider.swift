@@ -149,42 +149,56 @@ struct FoundationModelsResponder: Sendable {
         }
     }
 
+    /// The conversations' sessions, kept so that a request extending a session's transcript reuses it: Foundation
+    /// Models caches a prompt inside its session only, so a new session over the same transcript starts uncached.
+    let sessions = SessionCache()
+
     func respond(to request: JSONValue, emit: @escaping @Sendable (JSONValue) -> Void) async throws -> JSONValue {
         if let unavailable = availabilityError(model) {
             return Self.answer(stopReason: "error", usage: nil, error: unavailable)
         }
-        let messages = try (request["messages"] ?? []).decode(as: [Message].self)
         // A tool whose schema Foundation Models cannot express, such as one with untyped properties, is not offered.
-        let tools = (request["tools"]?.arrayValue ?? []).compactMap { try? Self.tool($0) }
+        let toolSpecifications = request["tools"]?.arrayValue ?? []
+        let tools = toolSpecifications.compactMap { try? Self.tool($0) }
         let options = request["options"] ?? [:]
         let vision = model.capabilities.contains(.vision)
 
         // The trailing user message is the prompt; after tool results, the session continues from an empty one.
-        var history = messages
-        var prompt: UserMessage?
-        if case .user(let last)? = history.last {
-            prompt = last
-            history.removeLast()
+        var history = request["messages"]?.arrayValue ?? []
+        var promptMessage: JSONValue?
+        if history.last?["role"]?.stringValue == "user" { promptMessage = history.removeLast() }
+        let prompt = try promptMessage.map { try $0.decode(as: UserMessage.self) }
+        let keys = history.map(Self.key)
+        let toolsKey = Self.canonical(.array(toolSpecifications))
+
+        // Reuse the conversation's session when this request extends its transcript; otherwise start one.
+        let sessionId = request["sessionId"]?.stringValue
+        let caching = sessionId != nil && request["cacheRetention"]?.stringValue != "none"
+        let session: LanguageModelSession
+        if caching, let sessionId, let cached = sessions.take(sessionId: sessionId, tools: toolsKey, keys: keys) {
+            session = cached.session
+            for message in history.dropFirst(cached.keys.count) {
+                session.transcript.append(contentsOf: try Self.entries(for: message, vision: vision))
+            }
+        } else {
+            var entries: [Transcript.Entry] = []
+            for message in history { entries += try Self.entries(for: message, vision: vision) }
+            session = LanguageModelSession(model: model, tools: tools, transcript: Transcript(entries: entries))
+            session.transcriptErrorHandlingPolicy = .preserveTranscript
         }
-        var entries: [Transcript.Entry] = []
-        let instructions = request["instructions"]?.stringValue ?? ""
-        if !instructions.isEmpty || !tools.isEmpty {
-            entries.append(.instructions(Transcript.Instructions(
-                segments: instructions.isEmpty ? [] : [.text(.init(content: instructions))],
-                toolDefinitions: tools.map(Transcript.ToolDefinition.init(tool:)))))
-        }
-        for message in history { entries += try Self.entries(for: message, vision: vision) }
+
         // The on-device model counts tokens locally: an overflow is reported before the request, in the same words on
         // every platform, so pi-durable compacts and retries.
         if let system = model as? SystemLanguageModel {
-            let counted = entries + [.prompt(Transcript.Prompt(segments: Self.segments(prompt?.content ?? [], vision: vision)))]
+            let counted = Array(session.transcript) + [.prompt(Transcript.Prompt(segments: Self.segments(prompt?.content ?? [], vision: vision)))]
             if let tokens = try? await system.tokenCount(for: counted), tokens > system.contextSize {
                 return Self.answer(stopReason: "error", usage: nil, error: Self.overflow(tokens: tokens, contextSize: system.contextSize))
             }
         }
-        let session = LanguageModelSession(model: model, tools: tools, transcript: Transcript(entries: entries))
-        session.transcriptErrorHandlingPolicy = .preserveTranscript
         let start = session.transcript.count
+        // `session.usage` totals every request of the session; a request's own is the difference.
+        let usageBefore = session.usage
+        func requestUsage() -> LanguageModelSession.Usage { Self.difference(session.usage, usageBefore) }
 
         let maxTokens = options["maxTokens"]?.intValue
         let generation = GenerationOptions(
@@ -192,6 +206,15 @@ struct FoundationModelsResponder: Sendable {
             toolCallingMode: tools.isEmpty ? nil : Self.toolCallingMode(options["toolChoice"]))
         let context = ContextOptions(
             reasoningLevel: model.capabilities.contains(.reasoning) ? Self.reasoningLevel(options["reasoning"]?.stringValue) : nil)
+
+        /// Keeps the session for the next request, under the transcript it now holds.
+        func keep(_ answer: JSONValue) -> JSONValue {
+            if caching, let sessionId {
+                let added = (promptMessage.map { [Self.key($0)] } ?? []) + [Self.key(Self.assistant(from: answer))]
+                sessions.put(SessionCache.Item(sessionId: sessionId, tools: toolsKey, keys: keys + added, session: session))
+            }
+            return answer
+        }
 
         var text = ""
         var thinking = ""
@@ -215,33 +238,149 @@ struct FoundationModelsResponder: Sendable {
                 text = content
             }
             try Task.checkCancellation()
-            let final = usage ?? session.usage
+            let final = usage ?? requestUsage()
             let truncated = maxTokens.map { final.output.totalTokenCount >= $0 } ?? false
-            return Self.answer(stopReason: truncated ? "length" : "stop", usage: final, text: text, thinking: thinking)
+            return keep(Self.answer(stopReason: truncated ? "length" : "stop", usage: final, text: text, thinking: thinking))
         } catch let error as LanguageModelSession.ToolCallError where error.underlyingError is ToolCallsRequested {
             let added = session.transcript.dropFirst(start)
             let calls = added.compactMap { entry -> Transcript.ToolCalls? in
                 if case .toolCalls(let calls) = entry { return calls }
                 return nil
             }.last
-            let toolCalls: [JSONValue] = try (calls.map(Array.init) ?? []).map { call in
-                [
-                    "id": .string(call.id), "name": .string(call.toolName),
-                    "arguments": try JSONValue(json: call.arguments.jsonString),
-                ]
+            let toolCalls: [JSONValue] = (calls.map(Array.init) ?? []).map { call in
+                ["id": .string(call.id), "name": .string(call.toolName), "argumentsJSON": .string(call.arguments.jsonString)]
             }
             // Text the model wrote before its calls, as the transcript recorded it.
             let written = added.compactMap { entry -> String? in
                 if case .response(let response) = entry { return Self.text(of: response.segments) }
                 return nil
             }.joined()
-            return Self.answer(
-                stopReason: "toolUse", usage: session.usage, toolCalls: toolCalls, text: written.isEmpty ? text : written,
-                thinking: Self.reasoning(in: added))
+            return keep(Self.answer(
+                stopReason: "toolUse", usage: requestUsage(), toolCalls: toolCalls, text: written.isEmpty ? text : written,
+                thinking: Self.reasoning(in: added)))
         } catch {
+            // A failed or cancelled request leaves the session in an unknown state; it is not reused.
             if Task.isCancelled || error is CancellationError { throw CancellationError() }
-            return Self.answer(stopReason: "error", usage: usage ?? session.usage, error: Self.message(for: error), text: text)
+            return Self.answer(stopReason: "error", usage: usage ?? requestUsage(), error: Self.message(for: error), text: text)
         }
+    }
+
+    static func difference(_ after: LanguageModelSession.Usage, _ before: LanguageModelSession.Usage) -> LanguageModelSession.Usage {
+        LanguageModelSession.Usage(
+            input: .init(
+                totalTokenCount: max(0, after.input.totalTokenCount - before.input.totalTokenCount),
+                cachedTokenCount: max(0, after.input.cachedTokenCount - before.input.cachedTokenCount)),
+            output: .init(
+                totalTokenCount: max(0, after.output.totalTokenCount - before.output.totalTokenCount),
+                reasoningTokenCount: max(0, after.output.reasoningTokenCount - before.output.reasoningTokenCount)))
+    }
+
+    // MARK: Session reuse
+
+    /// Sessions by conversation, each with the messages its transcript holds.
+    final class SessionCache: @unchecked Sendable {
+        struct Item {
+            let sessionId: String
+            /// The tools the session was created with; a session cannot change them.
+            let tools: String
+            /// A key per message the transcript holds.
+            let keys: [String]
+            let session: LanguageModelSession
+            var used = Date()
+        }
+
+        /// Sessions hold model memory; keep the most recently used few, and none idle for long.
+        static let limit = 8
+        static let idleLimit: TimeInterval = 15 * 60
+
+        private let lock = NSLock()
+        private var items: [Item] = []
+
+        /// Removes and returns the session of `sessionId` whose messages are the longest prefix of `keys`.
+        func take(sessionId: String, tools: String, keys: [String]) -> Item? {
+            lock.withLock {
+                let now = Date()
+                items.removeAll { now.timeIntervalSince($0.used) > Self.idleLimit }
+                let candidates = items.indices.filter { index in
+                    let item = items[index]
+                    return item.sessionId == sessionId && item.tools == tools && item.keys.count <= keys.count
+                        && !item.session.isResponding && Array(keys.prefix(item.keys.count)) == item.keys
+                }
+                guard let best = candidates.max(by: { items[$0].keys.count < items[$1].keys.count }) else { return nil }
+                return items.remove(at: best)
+            }
+        }
+
+        func put(_ item: Item) {
+            lock.withLock {
+                items.append(item)
+                if items.count > Self.limit {
+                    items.sort { $0.used > $1.used }
+                    items.removeLast(items.count - Self.limit)
+                }
+            }
+        }
+
+        var count: Int { lock.withLock { items.count } }
+    }
+
+    /// The assistant message the answer becomes, as pi-durable will send it back.
+    static func assistant(from answer: JSONValue) -> JSONValue {
+        let calls: [JSONValue] = (answer["toolCalls"]?.arrayValue ?? []).map { call in
+            [
+                "type": "toolCall", "id": call["id"] ?? "", "name": call["name"] ?? "",
+                "arguments": (try? JSONValue(json: call["argumentsJSON"]?.stringValue ?? "{}")) ?? [:],
+            ]
+        }
+        var content: [JSONValue] = []
+        if let thinking = answer["thinking"]?.stringValue, !thinking.isEmpty { content.append(["type": "thinking", "thinking": .string(thinking)]) }
+        if let text = answer["text"]?.stringValue, !text.isEmpty { content.append(["type": "text", "text": .string(text)]) }
+        return ["role": "assistant", "content": .array(content + calls)]
+    }
+
+    /// What identifies a message's part of the transcript: its role and content, without what changes between
+    /// sendings (timestamps, usage, provider metadata) or order that does not reach the model.
+    static func key(_ message: JSONValue) -> String {
+        let role = message["role"]?.stringValue ?? ""
+        func blocks(_ content: JSONValue?) -> [JSONValue] {
+            if let text = content?.stringValue { return [["type": "text", "text": .string(text)]] }
+            return content?.arrayValue ?? []
+        }
+        switch role {
+        case "assistant":
+            let content = blocks(message["content"])
+            let text = content.filter { $0["type"] == "text" }.compactMap { $0["text"]?.stringValue }.joined()
+            let thinking = content.filter { $0["type"] == "thinking" }.compactMap { $0["thinking"]?.stringValue }.joined()
+            let calls: [JSONValue] = content.filter { $0["type"] == "toolCall" }.map {
+                ["id": $0["id"] ?? "", "name": $0["name"] ?? "", "arguments": $0["arguments"] ?? [:]]
+            }
+            return canonical(["role": "assistant", "text": .string(text), "thinking": .string(thinking), "calls": .array(calls)])
+        case "toolResult":
+            return canonical([
+                "role": "toolResult", "id": message["toolCallId"] ?? "", "name": message["toolName"] ?? "",
+                "isError": message["isError"] ?? false, "content": .array(blocks(message["content"]).map(contentKey)),
+            ])
+        case "user":
+            return canonical(["role": "user", "content": .array(blocks(message["content"]).map(contentKey))])
+        default:
+            return canonical(message)
+        }
+    }
+
+    /// A content block's key: text as is, an image by type and data.
+    static func contentKey(_ block: JSONValue) -> JSONValue {
+        switch block["type"]?.stringValue {
+        case "text"?: ["type": "text", "text": block["text"] ?? ""]
+        case "image"?: ["type": "image", "mimeType": block["mimeType"] ?? "", "data": block["data"] ?? ""]
+        default: block
+        }
+    }
+
+    /// JSON text with sorted keys.
+    static func canonical(_ value: JSONValue) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return (try? String(decoding: encoder.encode(value), as: UTF8.self)) ?? ""
     }
 
     /// Why a model cannot answer now, in words pi-ai retries when waiting helps (a model still downloading).
@@ -397,12 +536,22 @@ struct FoundationModelsResponder: Sendable {
         }
     }
 
-    static func entries(for message: Message, vision: Bool) throws -> [Transcript.Entry] {
-        switch message {
+    static func entries(for json: JSONValue, vision: Bool) throws -> [Transcript.Entry] {
+        if json["role"]?.stringValue == "system" {
+            // A system message as instructions in place: the prompt, or an update to it, and the tools it adds.
+            let text = json["text"]?.stringValue ?? ""
+            let tools = (json["tools"]?.arrayValue ?? []).compactMap { try? tool($0) }
+            if text.isEmpty && tools.isEmpty { return [] }
+            return [.instructions(Transcript.Instructions(
+                segments: text.isEmpty ? [] : [.text(.init(content: text))],
+                toolDefinitions: tools.map(Transcript.ToolDefinition.init(tool:))))]
+        }
+        switch try json.decode(as: Message.self) {
         case .user(let user):
             return [.prompt(Transcript.Prompt(segments: segments(user.content, vision: vision)))]
         case .assistant(let assistant):
-            // Failed and aborted attempts without content add nothing; thinking is not replayed.
+            // Failed and aborted attempts without content add nothing. Thinking is not replayed: another model's may
+            // not be accepted, and a session that produced it holds it already.
             var entries: [Transcript.Entry] = []
             let text = assistant.content.compactMap(\.text).joined()
             if !text.isEmpty { entries.append(.response(Transcript.Response(segments: [.text(.init(content: text))]))) }

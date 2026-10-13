@@ -529,8 +529,15 @@ thinking levels apply to models that reason (Private Cloud Compute).
   whether Apple Intelligence is on and the model downloaded; offer the model only then. A model still downloading, a
   rate limit, or an unreachable Private Cloud Compute fails with an error pi-durable retries; guardrail violations and
   refusals are not retried.
+- **Caching.** Foundation Models caches a prompt inside its `LanguageModelSession` only, so the provider keeps each
+  conversation's session (by pi-durable's provider session ID) and extends it while the next request continues the
+  same transcript: later turns, tool rounds, and prompt section changes, which are appended in place, read the cache. A
+  reset, compaction, fork, edit, tool change, or restart starts a new session. The most recently used 8 sessions are
+  kept, none idle for over 15 minutes; `Settings.Stream(cacheRetention: "none")` starts every request fresh. Foundation
+  Models reports no cached tokens for a request that ends at a tool call, though it reads the cache, and the iOS
+  Simulator reports none at all.
 - **Limits.** Tools whose parameters Foundation Models cannot express (untyped properties) are not offered to these
-  models. Prompt caching and deferred requests don't apply. Private Cloud Compute needs Apple's entitlement in your app.
+  models. Deferred requests don't apply. Private Cloud Compute needs Apple's entitlement in your app.
 
 ### Signing in with a subscription (OAuth)
 

@@ -15,7 +15,8 @@ import {
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
+import { getSystemMessageText, renderSystemMessageUpdate } from "@earendil-works/pi-ai/utils/text";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import type { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { type Args, hostStream, register } from "./core.ts";
 import { modelsState } from "./models.ts";
@@ -55,11 +56,16 @@ type Answer = {
 	/** The response and reasoning as finally written; streamed deltas only append. */
 	text: string;
 	thinking: string;
-	toolCalls: { id: string; name: string; arguments: ToolCall["arguments"] }[];
+	/** Arguments as the model wrote them, so their key order survives. */
+	toolCalls: { id: string; name: string; argumentsJSON: string }[];
 	stopReason: AssistantMessage["stopReason"];
 	usage: { input: number; cachedInput: number; output: number; reasoning: number };
 	errorMessage?: string;
 };
+
+function toolDefinition(tool: { name: string; description: string; parameters: unknown }) {
+	return { name: tool.name, description: tool.description, parameters: foundationSchema(tool.parameters) };
+}
 
 function respond(models: number, provider: string, model: Model<Api>, context: Context, options: SimpleStreamOptions | undefined) {
 	const stream = createAssistantMessageEventStream();
@@ -122,13 +128,26 @@ async function run(
 				models,
 				provider,
 				model: model.id,
-				instructions: getCurrentSystemPrompt(messages as never) || (context as { systemPrompt?: string }).systemPrompt || "",
-				tools: getCurrentTools(messages as never).map((tool) => ({
-					name: tool.name,
-					description: tool.description,
-					parameters: foundationSchema(tool.parameters),
-				})),
-				messages: messages.filter((message) => message.role !== "system"),
+				// Every tool offered now; the session needs them all to resolve calls.
+				tools: getCurrentTools(messages as never).map(toolDefinition),
+				// System messages stay where they are, as pi-ai sends them to APIs that accept mid-conversation system
+				// messages: the leading one becomes the instructions, later ones instructions entries in place. A
+				// section change then extends the session instead of rewriting its start, which keeps its cache.
+				messages: messages.map((message, index) => {
+					if (message.role !== "system") return message;
+					const removed = (message.toolsRemoved ?? []).map((tool) => tool.name);
+					const text = [
+						index === 0 ? getSystemMessageText(message) : renderSystemMessageUpdate(message),
+						...(removed.length === 0 ? [] : [`These tools are no longer available: ${removed.join(", ")}.`]),
+					]
+						.filter((part) => part.length > 0)
+						.join("\n\n");
+					return { role: "system", text, tools: (message.toolsAdded ?? []).map(toolDefinition) };
+				}),
+				// The conversation's provider session: requests that extend what its Foundation Models session holds
+				// reuse that session and its cache.
+				sessionId: options?.sessionId ?? null,
+				cacheRetention: options?.cacheRetention ?? null,
 				options: {
 					temperature: options?.temperature ?? null,
 					maxTokens: options?.maxTokens ?? null,
@@ -164,11 +183,11 @@ async function run(
 		reconcile("text", answer.text);
 		close();
 		for (const call of answer.toolCalls) {
-			const block: ToolCall = { type: "toolCall", id: call.id, name: call.name, arguments: call.arguments };
+			const block: ToolCall = { type: "toolCall", id: call.id, name: call.name, arguments: JSON.parse(call.argumentsJSON) };
 			content.push({ ...block, arguments: {} });
 			const index = content.length - 1;
 			stream.push({ type: "toolcall_start", contentIndex: index, partial: partial() });
-			stream.push({ type: "toolcall_delta", contentIndex: index, delta: JSON.stringify(call.arguments), partial: partial() });
+			stream.push({ type: "toolcall_delta", contentIndex: index, delta: call.argumentsJSON, partial: partial() });
 			content[index] = block;
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: partial() });
 		}

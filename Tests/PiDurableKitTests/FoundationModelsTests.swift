@@ -255,6 +255,91 @@ struct FoundationModelsTests {
         #expect(FoundationModelsProvider.Model.onDevice().isAvailable == SystemLanguageModel.default.isAvailable)
     }
 
+    /// The iOS Simulator's Foundation Models reports no cached tokens, even within one session.
+    var reportsCaching: Bool {
+        #if targetEnvironment(simulator)
+        false
+        #else
+        true
+        #endif
+    }
+
+    @Test func laterTurnsReadTheCache() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let mood = Document("test.mood", initial: FileNote(text: "Be brief."))
+        let section = PromptSection("style") { input in try await input.document(mood).text }
+        let weather = Tool(
+            "get_weather", description: "Get the current weather for one city", parameters: .object(["city": .string("The city")])
+        ) { (args: City, _) in "It is 31 degrees in \(args.city)." }
+        let (harness, root) = try await setup(extensions: [
+            Extension("assistant", tools: [weather], sections: [
+                PromptSection("preamble", tag: false, text: String(repeating: "You are a careful, friendly assistant. ", count: 20)),
+                section,
+            ]),
+        ])
+        let first = try await withTimeout(60) { try await ask(root, "Name a fruit in one word.") }
+        let second = try await withTimeout(60) { try await ask(root, "Name a vegetable in one word.") }
+        // The second turn extends the first turn's session: everything before its prompt is cached. (The first turn
+        // may read cached instructions already: Foundation Models caches those across sessions.)
+        if reportsCaching {
+            #expect(second.usage.cacheRead >= first.usage.input + first.usage.cacheRead)
+            #expect(second.usage.input < 20)
+        }
+
+        // A tool round: the continuation after the tool results reads the cache too. (Foundation Models reports no
+        // cached tokens for the request that ends at the tool call, though it reuses the session's cache.)
+        let third = try await withTimeout(90) { try await ask(root, "What is the weather in Paris? Use get_weather.") }
+        let toolRound = try await root.view().entries.compactMap(\.assistantMessage).suffix(2)
+        #expect(toolRound.first?.stopReason == .toolUse)
+        if reportsCaching {
+            #expect(third.usage.cacheRead >= (toolRound.first?.usage.input ?? 1) + (toolRound.first?.usage.cacheRead ?? 0))
+        }
+
+        // A section change is appended in place: the conversation before it stays cached.
+        try await root.update(mood) { $0.text = "Answer in lowercase." }
+        let fourth = try await withTimeout(60) { try await ask(root, "Name a color in one word.") }
+        if reportsCaching {
+            #expect(fourth.usage.cacheRead >= third.usage.cacheRead)
+        }
+        try await harness.close()
+    }
+
+    @Test func answersMatchTheMessagesSentBack() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let answer: JSONValue = [
+            "text": "Let me check.", "thinking": "The user wants weather.",
+            "toolCalls": [["id": "c1", "name": "get_weather", "argumentsJSON": #"{"unit": "c", "city": "Paris"}"#]],
+        ]
+        // As pi-durable stores and sends it back: metadata added, blocks in another order, arguments re-encoded.
+        let sentBack: JSONValue = [
+            "role": "assistant", "api": "foundation-models:apple", "provider": "apple", "model": "on-device",
+            "stopReason": "toolUse", "timestamp": 1_700_000_000_000, "durationMs": 812,
+            "usage": ["input": 300, "output": 12, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 312],
+            "content": [
+                ["type": "text", "text": "Let me check."],
+                ["type": "thinking", "thinking": "The user wants weather."],
+                ["type": "toolCall", "id": "c1", "name": "get_weather", "arguments": ["city": "Paris", "unit": "c"]],
+            ],
+        ]
+        #expect(FoundationModelsResponder.key(FoundationModelsResponder.assistant(from: answer)) == FoundationModelsResponder.key(sentBack))
+        let user: JSONValue = ["role": "user", "content": "Hi", "timestamp": 1]
+        let userBlocks: JSONValue = ["role": "user", "content": [["type": "text", "text": "Hi"]], "timestamp": 2]
+        #expect(FoundationModelsResponder.key(user) == FoundationModelsResponder.key(userBlocks))
+    }
+
+    @Test func cacheRetentionNoneStartsFresh() async throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        let models = Models(builtinProviders: false)
+        try await models.register(FoundationModelsProvider())
+        let harness = try await Harness.open(
+            models: models, settings: Settings(stream: .init(cacheRetention: "none"), compaction: .forContextWindow(8192)))
+        let root = try await harness.root(agent: AgentChange(model: .appleOnDevice))
+        _ = try await withTimeout(60) { try await ask(root, "Name a fruit in one word.") }
+        let second = try await withTimeout(60) { try await ask(root, "Name a vegetable in one word.") }
+        #expect(second.usage.cacheRead == 0)
+        try await harness.close()
+    }
+
     @Test func builtinToolSchemasDecode() async throws {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
         let models = Models(builtinProviders: false)
