@@ -436,10 +436,11 @@ struct FoundationModelsResponder: Sendable {
     }
 
     /// Error text in the words pi-ai classifies: a context overflow as one, so pi-durable compacts and retries, and
-    /// transient failures (rate limits, timeouts, network, a busy service) as retryable; refusals and guardrail
-    /// violations are not retried.
+    /// transient failures (rate limits, timeouts, network, a busy service, a request the system cancelled) as
+    /// retryable; quota limits, refusals and guardrail violations are not retried. Each is a sentence an app can show,
+    /// never an `NSError` dump.
     static func message(for error: Error) -> String {
-        let detail = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        let detail = describe(error)
         if let error = error as? LanguageModelError {
             switch error {
             case .contextSizeExceeded(let exceeded):
@@ -448,7 +449,7 @@ struct FoundationModelsResponder: Sendable {
             case .timeout: return "Request timed out: \(detail)"
             case .guardrailViolation: return "Guardrail violation: \(detail)"
             case .refusal: return "The model refused: \(detail)"
-            default: return detail
+            default: break
             }
         }
         if let error = error as? LanguageModelSession.GenerationError {
@@ -457,21 +458,57 @@ struct FoundationModelsResponder: Sendable {
             case .rateLimited: return "Rate limit reached: \(detail)"
             case .assetsUnavailable: return "The model's assets are unavailable (service unavailable): \(detail)"
             case .concurrentRequests: return "The model is busy with other requests (service unavailable): \(detail)"
-            default: return detail
+            default: break
             }
         }
         if let error = error as? PrivateCloudComputeLanguageModel.Error {
             switch error {
             case .networkFailure: return "Network error reaching Private Cloud Compute: \(detail)"
             case .serviceUnavailable: return "Private Cloud Compute: service unavailable: \(detail)"
-            case .quotaLimitReached: return "Private Cloud Compute quota limit reached: \(detail)"
-            @unknown default: return detail
+            case .quotaLimitReached(let reached):
+                let reset = reached.resetDate.map { " until \($0.formatted(.iso8601))" } ?? ""
+                return "Private Cloud Compute quota limit reached\(reset): \(detail)"
+            @unknown default: break
             }
         }
         if case .assetsUnavailable? = error as? SystemLanguageModel.Error {
             return "Apple's on-device model assets are unavailable (service unavailable): \(detail)"
         }
-        return detail
+        // Failures without a public case arrive as an `NSError` over Apple's own `GenerativeError`, whose code is its
+        // category in millions (undocumented; read from the framework): 2 a request the system cancelled, 3 a
+        // network failure.
+        if let generative = underlying(error).last(where: { $0.domain == generativeErrorDomain }) {
+            switch generative.code / 1_000_000 {
+            case 2: return "The system cancelled the request (service unavailable): \(detail)"
+            case 3: return "Network error: \(detail)"
+            default: break
+            }
+        }
+        return "The model could not answer: \(detail)"
+    }
+
+    static let generativeErrorDomain = "com.apple.GenerativeFunctionsFoundation.GenerativeError"
+
+    /// An error in a few words: its own description when it has one, otherwise its domain and code and those of the
+    /// errors under it ("LanguageModelError -1, GenerativeError 2010000").
+    static func describe(_ error: Error) -> String {
+        let words = (error as? LocalizedError)?.errorDescription ?? (error as? CustomDebugStringConvertible)?.debugDescription
+        // (An `NSError`'s debug description is its dump, "Error Domain=… UserInfo={…}".)
+        if let words, !words.isEmpty, !words.hasPrefix("Error Domain=") { return words }
+        var codes: [String] = []
+        for error in [error as NSError] + underlying(error) {
+            let code = "\(error.domain.split(separator: ".").last ?? "") \(error.code)"
+            if !codes.contains(code) { codes.append(code) }
+        }
+        return codes.joined(separator: ", ")
+    }
+
+    /// The errors under `error`, outermost first.
+    static func underlying(_ error: Error) -> [NSError] {
+        let info = (error as NSError).userInfo
+        let direct = (info[NSUnderlyingErrorKey] as? NSError).map { [$0] } ?? []
+        let multiple = info[NSMultipleUnderlyingErrorsKey] as? [NSError] ?? []
+        return (direct + multiple).flatMap { [$0] + underlying($0) }
     }
 
     /// A context overflow in pi-ai's words, with what lets pi-durable compact a window this small.

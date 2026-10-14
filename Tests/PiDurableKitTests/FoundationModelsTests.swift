@@ -241,6 +241,17 @@ struct FoundationModelsTests {
         #expect(timeout.lowercased().contains("timed out"))
         let overflow = FoundationModelsResponder.overflow(tokens: 9000, contextSize: 8192)
         #expect(overflow.contains("exceeds the context window"))
+        // A request the system cancelled, as Private Cloud Compute reports it: an `NSError` over a `GenerativeError`.
+        let generative = NSError(domain: FoundationModelsResponder.generativeErrorDomain, code: 2_010_000)
+        let cancelled = NSError(domain: "FoundationModels.LanguageModelError", code: -1, userInfo: [
+            NSMultipleUnderlyingErrorsKey: [NSError(domain: "FoundationModels.LanguageModelError", code: -1, userInfo: [NSMultipleUnderlyingErrorsKey: [generative]])],
+        ])
+        #expect(FoundationModelsResponder.message(for: cancelled) == "The system cancelled the request (service unavailable): LanguageModelError -1, GenerativeError 2010000")
+        let unknown = NSError(domain: "FoundationModels.LanguageModelError", code: -1)
+        #expect(FoundationModelsResponder.message(for: unknown) == "The model could not answer: LanguageModelError -1")
+        let quota = FoundationModelsResponder.message(for: PrivateCloudComputeLanguageModel.Error.quotaLimitReached(.init(
+            resetDate: Date(timeIntervalSince1970: 1_800_000_000), debugDescription: "limit")))
+        #expect(quota.hasPrefix("Private Cloud Compute quota limit reached until 2027-01-15T08:00:00Z: "))
         // A model without vision gets placeholders instead of images.
         let segments = FoundationModelsResponder.segments([.image(ImageContent(data: Data([1, 2]), mimeType: "image/png"))], vision: false)
         guard case .text(let text)? = segments.first else {
