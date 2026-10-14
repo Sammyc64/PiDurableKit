@@ -29,6 +29,7 @@ import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.l
 import { piMessagesApi } from "@earendil-works/pi-ai/api/pi-messages.lazy";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { HostModelsStore, withRemoteCatalogs } from "./catalog.ts";
 import { type Args, emit, finish, host, openStream, register } from "./core.ts";
 import type { Context as ChordContext } from "@earendil-works/chord";
 
@@ -196,11 +197,18 @@ register({
 		})();
 	},
 
-	"models.create": (args) => {
+	// With a `catalog` URL, the built-in providers get its newer catalogs, as pi does; those kept from before are
+	// restored straight away (offline), and `models.refresh` checks for newer ones.
+	"models.create": async (args) => {
 		const credentials = new HostCredentialStore(args.id);
-		const models = createModels({ credentials });
-		if (args.builtin !== false) for (const provider of builtinProviders()) models.setProvider(provider);
+		const catalog = (args.catalog as string | null | undefined) ?? undefined;
+		const models = createModels({ credentials, ...(catalog ? { modelsStore: new HostModelsStore(args.id) } : {}) });
+		if (args.builtin !== false) {
+			const providers = builtinProviders();
+			for (const provider of catalog ? withRemoteCatalogs(providers, catalog) : providers) models.setProvider(provider);
+		}
 		modelSets.set(args.id, { models, credentials, fauxes: new Map() });
+		if (catalog && args.builtin !== false) await models.refresh({ allowNetwork: false });
 	},
 	"models.dispose": (args) => {
 		modelSets.delete(args.id);

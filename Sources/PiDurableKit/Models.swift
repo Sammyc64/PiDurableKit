@@ -23,10 +23,14 @@ public final class Models: Sendable {
     ///   - credentials: Where credentials are kept. Use ``KeychainCredentialStore`` (`.keychain`) so OAuth sign-ins
     ///     survive relaunches.
     ///   - builtinProviders: Whether to register every built-in pi-ai provider.
+    ///   - catalog: Where the built-in providers find models newer than this package's, as pi does (pi.dev's
+    ///     catalog by default); `nil` keeps to the bundled models. Catalogs kept from before are restored at once;
+    ///     ``refresh(providers:allowNetwork:force:)`` checks for newer ones.
     ///   - runtime: The JavaScript runtime the models live in; a harness must use the same runtime.
     public init(
         credentials: any CredentialStore = InMemoryCredentialStore(),
         builtinProviders: Bool = true,
+        catalog: ModelCatalog? = .piDev,
         runtime: Runtime = .shared
     ) {
         self.runtime = runtime
@@ -35,8 +39,10 @@ public final class Models: Sendable {
         let id = Self.makeID()
         self.id = id
         engine.host.setCredentialStore(credentials, models: id)
+        if let catalog { engine.host.setCatalogStore(ModelCatalogStore(directory: catalog.directory), models: id) }
         ready = Task {
-            try await engine.perform("models.create", ["id": id, "builtin": builtinProviders])
+            try await engine.perform(
+                "models.create", ["id": id, "builtin": builtinProviders, "catalog": catalog?.url.absoluteString])
         }
     }
 
@@ -159,7 +165,8 @@ public final class Models: Sendable {
         try await credentials.credential(for: provider)
     }
 
-    /// Reloads model catalogs of dynamic providers (OpenRouter, llama.cpp, …). Static built-in catalogs don't change.
+    /// Reloads model catalogs: the ``ModelCatalog``'s newer models for the built-in providers, and those of dynamic
+    /// providers. Call it at launch, say, then list the models again.
     ///
     /// - Parameters:
     ///   - providers: Only these providers; all by default.

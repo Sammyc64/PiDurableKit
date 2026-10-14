@@ -31,6 +31,7 @@ final class HostRouter: Sendable {
         var documents: [String: DocumentCallbacks] = [:]
         var nextID = 1
         var credentials: [Int: any CredentialStore] = [:]
+        var catalogs: [Int: ModelCatalogStore] = [:]
         var databases: [Int: any SQLiteDatabase] = [:]
         var transactions: [Int: SQLiteTransaction] = [:]
         var logins: [Int: LoginSession] = [:]
@@ -107,9 +108,14 @@ final class HostRouter: Sendable {
         state.withLock { $0.credentials[models] = store }
     }
 
+    func setCatalogStore(_ store: ModelCatalogStore, models: Int) {
+        state.withLock { $0.catalogs[models] = store }
+    }
+
     func removeModels(_ models: Int) {
         state.withLock { state in
             state.credentials[models] = nil
+            state.catalogs[models] = nil
             state.responders = state.responders.filter { !$0.key.hasPrefix("\(models)/") }
             state.languageModels = state.languageModels.filter { !$0.key.hasPrefix("\(models)/") }
         }
@@ -260,6 +266,8 @@ final class HostRouter: Sendable {
             case "credentials.read": try await credentialStore(arguments).credential(for: provider(arguments))
             case "credentials.write": try await writeCredential(arguments)
             case "credentials.list": try await listCredentials(arguments)
+            case "modelsStore.read": try catalogStore(arguments).read(provider(arguments))
+            case "modelsStore.write": try writeCatalog(arguments)
             case "login.prompt": try await loginPrompt(arguments)
             case "login.notify": loginNotify(arguments)
             case "env.custom": try await customEnvironment(arguments)
@@ -868,6 +876,20 @@ final class HostRouter: Sendable {
             throw PiDurableError.runtime("The models collection was released")
         }
         return store
+    }
+
+    private func catalogStore(_ arguments: JSONValue) throws -> ModelCatalogStore {
+        let models = arguments["models"]?.intValue ?? 0
+        guard let store = state.withLock({ $0.catalogs[models] }) else {
+            throw PiDurableError.runtime("The models collection was released")
+        }
+        return store
+    }
+
+    private func writeCatalog(_ arguments: JSONValue) throws -> JSONValue? {
+        let entry = arguments["entry"].flatMap { $0 == .null ? nil : $0 }
+        try catalogStore(arguments).write(entry, for: provider(arguments))
+        return nil
     }
 
     private func provider(_ arguments: JSONValue) -> ProviderID {

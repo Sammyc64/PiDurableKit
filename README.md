@@ -478,6 +478,8 @@ of conversations, entries, and documents, the same storage formats, and its comm
 
 `Models()` registers every built-in pi-ai provider. iOS has no environment variables, so pass keys explicitly (store them in the Keychain):
 
+As in pi, the built-in providers also get models released after this package was built, from pi.dev's catalog (`ModelCatalog`, kept in Caches for offline use). Call `models.refresh()` at launch to check for them (at most every four hours per provider with a credential), then list the models again. `Models(catalog: nil)` keeps to the bundled models.
+
 ```swift
 let models = Models(credentials: .keychain)
 try await models.setAPIKey(anthropicKey, for: .anthropic)

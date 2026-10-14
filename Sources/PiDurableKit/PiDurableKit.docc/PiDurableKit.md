@@ -45,6 +45,7 @@ if case .done(_, let answer?) = settled.status {
 
 - ``Models``
 - ``ModelRef``
+- ``ModelCatalog``
 - ``CustomProvider``
 - ``FoundationModelsProvider``
 - ``FauxProvider``
