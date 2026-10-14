@@ -175,6 +175,20 @@ public final class Models: Sendable {
         try await perform("models.addProvider", ["provider": provider])
     }
 
+    /// Removes a provider: a ``CustomProvider``, ``FauxProvider`` or ``FoundationModelsProvider`` registered before,
+    /// or a built-in one. Its models are no longer listed, and requests to them fail with ``PiDurableError/notFound(_:)``.
+    /// Its stored credential stays; remove it with ``logout(from:)``. Removing a provider that isn't registered does
+    /// nothing.
+    ///
+    /// ```swift
+    /// try await models.unregister("ollama")
+    /// try await models.logout(from: "ollama")
+    /// ```
+    public func unregister(_ provider: ProviderID) async throws {
+        try await perform("models.removeProvider", ["provider": provider])
+        runtime.engine.host.removeLanguageModels(models: id, provider: provider)
+    }
+
     /// Registers a scripted provider for tests, previews, and demos.
     public func register(_ faux: FauxProvider) async throws {
         try await perform(

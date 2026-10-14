@@ -494,6 +494,9 @@ try await models.register(CustomProvider(
     ]))
 ```
 
+`models.unregister("gateway")` takes a provider away again (any provider, built-in ones included); its stored
+credential stays until `models.logout(from:)`.
+
 Headers work as in pi-ai: a model's `headers` (inheriting its provider's) go with that model's requests, and
 `Settings.Stream.headers` go with every request.
 

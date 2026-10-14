@@ -294,6 +294,12 @@ register({
 		);
 		if (!keyless) await state.credentials.modify(spec.id, async () => ({ type: "api_key", key: spec.apiKey }) as never);
 	},
+	// pi-ai `deleteProvider`: a custom, faux, or Foundation Models provider, or a built-in one. Its stored credential stays.
+	"models.removeProvider": (args) => {
+		const state = modelsState(args.id);
+		state.models.deleteProvider(args.provider);
+		state.fauxes.delete(args.provider);
+	},
 	"models.addFaux": (args) => {
 		const state = modelsState(args.id);
 		const faux = fauxProvider({

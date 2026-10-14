@@ -41,6 +41,45 @@ extension MockServerTests {
         try await harness.close()
     }
 
+    @Test func unregisteringAProvider() async throws {
+        let models = Models(builtinProviders: false, runtime: Self.runtime)
+        try await models.register(CustomProvider(
+            id: "gone", baseURL: URL(string: "https://gone.test/v1")!, apiKey: "secret", models: [.init(id: "m")]))
+        try await models.register(CustomProvider(
+            id: "kept", baseURL: URL(string: "https://kept.test/v1")!, models: [.init(id: "m")]))
+        #expect(try await models.models(for: "gone").map(\.modelId) == ["m"])
+
+        try await models.unregister("gone")
+        #expect(try await models.models(for: "gone").isEmpty)
+        #expect(try await models.providers().map(\.id) == ["kept"])
+        #expect(try await models.models().map(\.provider) == ["kept"])
+        // The credential stays until logging out.
+        #expect(try await models.credential(for: "gone")?.apiKey == "secret")
+        try await models.logout(from: "gone")
+        #expect(try await models.credential(for: "gone") == nil)
+
+        let harness = try await Harness.open(models: models, settings: Settings(retry: .init(enabled: false)))
+        let root = try await harness.root(agent: AgentChange(model: ModelRef(provider: "gone", modelId: "m")))
+        await #expect(throws: (any Error).self) { _ = try await ask(root, "Hi") }
+        try await harness.close()
+
+        // Unregistering one that isn't there does nothing, and the same ID can be registered again.
+        try await models.unregister("never")
+        try await models.register(CustomProvider(
+            id: "gone", baseURL: URL(string: "https://gone.test/v1")!, models: [.init(id: "again")]))
+        #expect(try await models.models(for: "gone").map(\.modelId) == ["again"])
+    }
+
+    @Test func unregisteringAFauxProvider() async throws {
+        let faux = FauxProvider(id: "scripted")
+        let models = Models(builtinProviders: false, runtime: Self.runtime)
+        try await models.register(faux)
+        try await faux.append(.text("Hi"))
+        try await models.unregister("scripted")
+        #expect(try await models.providers().isEmpty)
+        await #expect(throws: (any Error).self) { try await faux.append(.text("Again")) }
+    }
+
     @Test func providerAndModelHeaders() async throws {
         let completion = #"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}]}"#
         MockServer.handle(host: "headers.test") { _ in .init(chunks: [.sse(completion), "data: [DONE]\n\n"]) }
