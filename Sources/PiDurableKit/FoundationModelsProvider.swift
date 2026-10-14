@@ -110,14 +110,16 @@ extension Models {
         for model in provider.models {
             let capabilities = model.model.capabilities
             let contextWindow = await model.resolvedContextWindow()
-            specifications.append([
+            var specification: JSONObject = [
                 "id": .string(model.id),
                 "name": .string(model.name),
                 "contextWindow": .number(Double(contextWindow)),
                 "maxTokens": .number(Double(contextWindow)),
                 "reasoning": .bool(capabilities.contains(.reasoning)),
                 "input": capabilities.contains(.vision) ? ["text", "image"] : ["text"],
-            ])
+            ]
+            if capabilities.contains(.reasoning) { specification["thinkingLevelMap"] = .object(FoundationModelsResponder.thinkingLevelMap) }
+            specifications.append(.object(specification))
             let responder = FoundationModelsResponder(model: model.model)
             runtime.engine.host.setLanguageModel(models: id, provider: provider.id, model: model.id) { request, emit in
                 try await responder.respond(to: request, emit: emit)
@@ -492,9 +494,9 @@ struct FoundationModelsResponder: Sendable {
     /// An error in a few words: its own description when it has one, otherwise its domain and code and those of the
     /// errors under it ("LanguageModelError -1, GenerativeError 2010000").
     static func describe(_ error: Error) -> String {
-        let words = (error as? LocalizedError)?.errorDescription ?? (error as? CustomDebugStringConvertible)?.debugDescription
+        let words = (error as? LocalizedError)?.errorDescription ?? String(reflecting: error)
         // (An `NSError`'s debug description is its dump, "Error Domain=… UserInfo={…}".)
-        if let words, !words.isEmpty, !words.hasPrefix("Error Domain=") { return words }
+        if !words.isEmpty, !words.hasPrefix("Error Domain=") { return words }
         var codes: [String] = []
         for error in [error as NSError] + underlying(error) {
             let code = "\(error.domain.split(separator: ".").last ?? "") \(error.code)"
@@ -525,12 +527,19 @@ struct FoundationModelsResponder: Sendable {
         }
     }
 
-    static func reasoningLevel(_ level: String?) -> ContextOptions.ReasoningLevel? {
+    /// The thinking levels a reasoning model has (pi-ai `thinkingLevelMap`): Foundation Models' three, as low, medium
+    /// and high. Reasoning can't be turned off, and pi's other levels would only repeat these.
+    static let thinkingLevelMap: JSONObject = [
+        "off": .null, "minimal": .null, "low": "light", "medium": "moderate", "high": "deep",
+    ]
+
+    /// A thinking level as Foundation Models' reasoning level; one the model doesn't have is the nearest it does, as pi
+    /// clamps levels (off and minimal are light, above high is deep).
+    static func reasoningLevel(_ level: String?) -> ContextOptions.ReasoningLevel {
         switch level {
-        case "minimal"?, "low"?: .light
         case "medium"?: .moderate
         case "high"?, "xhigh"?, "max"?: .deep
-        default: nil
+        default: .light
         }
     }
 

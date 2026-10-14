@@ -251,6 +251,7 @@ register({
 					provider: args.provider,
 					baseUrl: "apple://foundation-models",
 					reasoning: model.reasoning === true,
+					...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
 					input: model.input ?? ["text"],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: model.contextWindow,
