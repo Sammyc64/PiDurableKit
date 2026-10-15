@@ -260,3 +260,19 @@ function withPersonalizedCatalog(
 		},
 	};
 }
+
+/**
+ * A custom provider serving a built-in provider's models (`CustomProvider.catalog`): the source's catalog (its built-in
+ * models and pi.dev's newer ones), each pointed at the custom provider (its ID, address and headers). Refreshing it
+ * refreshes the source's catalog overlay, under the custom provider's own credential, so it stays current whether or
+ * not the source itself is signed in.
+ */
+export function followingCatalog(custom: Provider, source: Provider, retarget: (model: AnyModel) => AnyModel): Provider {
+	return {
+		...custom,
+		getModels: () => source.getModels().map((model) => retarget(model)) as ReturnType<Provider["getModels"]>,
+		getAllModels: () => (source.getAllModels?.() ?? source.getModels()).map(retarget),
+		...(source.refreshModels ? { refreshModels: (context: RefreshModelsContext) => source.refreshModels!(context) } : {}),
+	};
+}
+

@@ -394,6 +394,10 @@ public struct CustomProvider: Encodable, Sendable {
     public var headers: [String: String]?
     /// How the provider signs in with OAuth, for a provider used with OAuth tokens rather than an API key.
     public var oauth: OAuth?
+    /// A built-in provider whose models this one serves (a gateway in front of it, or the same API with other
+    /// credentials): its catalog, each model pointed here, kept current as ``Models/refresh(providers:allowNetwork:force:)``
+    /// refreshes this provider (under this provider's credential). `models` are then only used where it has none.
+    public var catalog: ProviderID?
     public var models: [Model]
 
     /// A provider's OAuth 2: how it signs in (``Models/login(to:interaction:installationID:agentName:)``), in the
@@ -464,7 +468,7 @@ public struct CustomProvider: Encodable, Sendable {
 
     public init(
         id: ProviderID, name: String? = nil, baseURL: URL, api: API = .openAICompletions, apiKey: String? = nil,
-        headers: [String: String]? = nil, oauth: OAuth? = nil, models: [Model]
+        headers: [String: String]? = nil, oauth: OAuth? = nil, catalog: ProviderID? = nil, models: [Model] = []
     ) {
         self.id = id
         self.name = name
@@ -473,6 +477,7 @@ public struct CustomProvider: Encodable, Sendable {
         self.apiKey = apiKey
         self.headers = headers
         self.oauth = oauth
+        self.catalog = catalog
         self.models = models
     }
 
@@ -485,6 +490,7 @@ public struct CustomProvider: Encodable, Sendable {
         try container.encodeIfPresent(apiKey, forKey: AnyKey("apiKey"))
         try container.encodeIfPresent(headers, forKey: AnyKey("headers"))
         try container.encodeIfPresent(oauth, forKey: AnyKey("oauth"))
+        try container.encodeIfPresent(catalog, forKey: AnyKey("catalog"))
         try container.encode(models, forKey: AnyKey("models"))
     }
 }

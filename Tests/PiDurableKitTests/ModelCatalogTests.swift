@@ -28,6 +28,27 @@ extension MockServerTests {
         ModelCatalog(url: URL(string: "https://catalog.test")!, directory: directory)
     }
 
+    /// A custom provider following Anthropic's catalog gets its newer models by refreshing itself, with its own
+    /// credential, while Anthropic has none.
+    @Test func aCustomProviderFollowingACatalogRefreshesIt() async throws {
+        Self.serveCatalog(lastModified: "Fri, 01 Jan 2100 00:00:00 GMT")
+        let directory = URL.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let models = Models(catalog: Self.catalog(directory), runtime: Self.runtime)
+        try await models.register(CustomProvider(
+            id: "claude-gateway", baseURL: URL(string: "https://gateway.test")!, api: .anthropicMessages, apiKey: "secret",
+            catalog: .anthropic))
+        #expect(try await models.credential(for: .anthropic) == nil)
+        #expect(try await !models.models(for: "claude-gateway").contains { $0.modelId == "claude-next" })
+
+        let result = try await models.refresh(providers: ["claude-gateway"])
+        #expect(result.errors.isEmpty)
+        let added = try #require(try await models.models(for: "claude-gateway").first { $0.modelId == "claude-next" })
+        #expect(added.provider == "claude-gateway")
+        #expect(added.baseUrl == "https://gateway.test")
+        #expect(added.contextWindow == 1_000_000)
+    }
+
     @Test func addsNewerModelsAndKeepsThemForTheNextLaunch() async throws {
         Self.serveCatalog(lastModified: "Fri, 01 Jan 2100 00:00:00 GMT")
         let directory = URL.temporaryDirectory.appending(path: UUID().uuidString)

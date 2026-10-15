@@ -1,6 +1,7 @@
 // Model access: pi-ai Models collections, credentials kept by Swift, OAuth sign-in, custom and faux providers.
 import type { Context } from "@earendil-works/chord";
 import {
+	type AnyModel,
 	type AssistantMessage,
 	type AuthEvent,
 	type AuthPrompt,
@@ -18,6 +19,7 @@ import {
 	type MutableModels,
 	type OAuthAuth,
 	type OAuthCredential,
+	type Provider,
 	type ProviderAuthInteraction,
 	type ProviderStreams,
 } from "@earendil-works/pi-ai";
@@ -37,7 +39,7 @@ import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.l
 import { piMessagesApi } from "@earendil-works/pi-ai/api/pi-messages.lazy";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import { HostModelsStore, withRemoteCatalogs } from "./catalog.ts";
+import { followingCatalog, HostModelsStore, withRemoteCatalogs } from "./catalog.ts";
 import { type Args, emit, finish, host, openStream, register } from "./core.ts";
 import type { Context as ChordContext } from "@earendil-works/chord";
 
@@ -505,30 +507,47 @@ register({
 			baseUrl: model.baseUrl ?? spec.baseUrl,
 			...(spec.headers || model.headers ? { headers: { ...(spec.headers ?? {}), ...(model.headers ?? {}) } } : {}),
 		}));
+		// Serving a built-in provider's models: its catalog, pointed here, and kept current.
+		const source = typeof spec.catalog === "string" ? state.models.getProviders().find((candidate) => candidate.id === spec.catalog) : undefined;
 		const api: Record<string, ProviderStreams> = {};
-		for (const model of models) {
+		const sourceModels = source ? (source.getModels() as unknown as { api: string }[]) : [];
+		for (const model of [...models, ...sourceModels]) {
 			const implementation = apis[model.api];
 			if (implementation === undefined) throw new Error(`Unsupported API "${model.api}"`);
 			api[model.api] ??= implementation();
 		}
 		// Keyless servers (Ollama, LM Studio) still get a placeholder key: the SDKs refuse to send without one.
 		const keyless = spec.apiKey === undefined || spec.apiKey === null;
-		state.models.setProvider(
-			createProvider({
-				id: spec.id,
-				name: spec.name ?? spec.id,
-				baseUrl: spec.baseUrl,
-				...(spec.headers ? { headers: spec.headers } : {}),
-				auth: {
-					apiKey: keyless
-						? { name: spec.name ?? spec.id, resolve: async () => ({ auth: { apiKey: "unused" } }) }
-						: envApiKeyAuth(spec.name ?? spec.id, []),
-					...(spec.oauth ? { oauth: customOAuthAuth(spec.name ?? spec.id, spec.oauth as CustomOAuth) } : {}),
-				},
-				models: models as never,
-				api: api as never,
-			}) as never,
-		);
+		let provider = (
+				createProvider({
+					id: spec.id,
+					name: spec.name ?? spec.id,
+					baseUrl: spec.baseUrl,
+					...(spec.headers ? { headers: spec.headers } : {}),
+					auth: {
+						apiKey: keyless
+							? { name: spec.name ?? spec.id, resolve: async () => ({ auth: { apiKey: "unused" } }) }
+							: envApiKeyAuth(spec.name ?? spec.id, []),
+						...(spec.oauth ? { oauth: customOAuthAuth(spec.name ?? spec.id, spec.oauth as CustomOAuth) } : {}),
+					},
+					models: models as never,
+					api: api as never,
+				}) as never
+		) as unknown as Provider;
+		if (source) {
+			const headers = spec.headers as Record<string, string> | undefined;
+			provider = followingCatalog(provider, source as unknown as Provider, (model) =>
+				({
+					...model,
+					provider: spec.id,
+					baseUrl: spec.baseUrl,
+					...(headers || (model as { headers?: Record<string, string> }).headers
+						? { headers: { ...((model as { headers?: Record<string, string> }).headers ?? {}), ...(headers ?? {}) } }
+						: {}),
+				}) as AnyModel,
+			);
+		}
+		state.models.setProvider(provider as never);
 		if (!keyless) await state.credentials.modify(spec.id, async () => ({ type: "api_key", key: spec.apiKey }) as never);
 	},
 	// pi-ai `deleteProvider`: a custom, faux, or Foundation Models provider, or a built-in one. Its stored credential stays.

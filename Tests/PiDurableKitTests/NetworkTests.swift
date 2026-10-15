@@ -111,6 +111,20 @@ extension MockServerTests {
         try await harness.close()
     }
 
+    /// A custom provider serving a built-in provider's models: its catalog, pointed at the custom provider's address.
+    @Test func customProviderFollowsABuiltInCatalog() async throws {
+        let models = Models(catalog: nil, runtime: Self.runtime)
+        let builtin = try await models.models(for: .anthropic)
+        #expect(!builtin.isEmpty)
+        try await models.register(CustomProvider(
+            id: "claude-gateway", baseURL: URL(string: "https://gateway.test")!, api: .anthropicMessages, apiKey: "secret",
+            catalog: .anthropic))
+        let following = try await models.models(for: "claude-gateway")
+        #expect(following.map { $0.modelId } == builtin.map { $0.modelId })
+        #expect(following.allSatisfy { $0.provider == "claude-gateway" && $0.baseUrl == "https://gateway.test" })
+        #expect(following.first?.contextWindow == builtin.first?.contextWindow)
+    }
+
     @Test func unregisteringAProvider() async throws {
         let models = Models(builtinProviders: false, runtime: Self.runtime)
         try await models.register(CustomProvider(

@@ -520,6 +520,11 @@ try await models.login(to: "service", interaction: .webAuthenticationSession())
 With `signIn: nil`, store tokens from a sign-in made elsewhere instead:
 `models.setCredential(.oauth(accessToken:refreshToken:expiresAt:), for: "service")`.
 
+A custom provider can also serve a built-in provider's models, such as a gateway in front of it, or the same API with
+other credentials: give it `catalog: .anthropic`, and its models are Anthropic's catalog (the built-in models and
+pi.dev's newer ones), each pointed at the custom provider, refreshed as `models.refresh` refreshes it, under its own
+credential.
+
 `ProviderInfo.acceptsAPIKey` says which providers take an API key; some built-in ones only have a sign-in.
 
 > Shipping provider API keys inside an app exposes them to anyone who inspects it. For production, point a `CustomProvider` (or `Settings.Stream.headers`) at your own backend proxy.
