@@ -49,6 +49,23 @@ private final class SessionHolder: @unchecked Sendable {
     var session: ASWebAuthenticationSession?
 }
 
+/// Resumes a continuation once: a session that can't start (presented while the app isn't active, say) also calls its
+/// completion handler with an error, so either may come first, and the second does nothing.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+
+    init(_ continuation: CheckedContinuation<Void, Error>) { self.continuation = continuation }
+
+    func resume(throwing error: Error?) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        if let error { continuation?.resume(throwing: error) } else { continuation?.resume() }
+    }
+}
+
 private final class WeakAnchor: @unchecked Sendable {
     weak var window: ASPresentationAnchor?
     init(_ window: ASPresentationAnchor?) { self.window = window }
@@ -82,8 +99,9 @@ private final class WebAuthenticationPresenter: NSObject, ASWebAuthenticationPre
         let holder = SessionHolder()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let once = ResumeOnce(continuation)
                 let completion: ASWebAuthenticationSession.CompletionHandler = { _, error in
-                    if let error { continuation.resume(throwing: error) } else { continuation.resume() }
+                    once.resume(throwing: error)
                 }
                 let created: ASWebAuthenticationSession
                 if #available(iOS 17.4, macOS 14.4, visionOS 1.1, *) {
@@ -95,7 +113,7 @@ private final class WebAuthenticationPresenter: NSObject, ASWebAuthenticationPre
                 created.prefersEphemeralWebBrowserSession = prefersEphemeral
                 holder.session = created
                 if Task.isCancelled || !created.start() {
-                    continuation.resume(throwing: CancellationError())
+                    once.resume(throwing: CancellationError())
                 }
             }
         } onCancel: {
