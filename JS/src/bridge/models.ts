@@ -331,11 +331,12 @@ function customOAuthAuth(name: string, oauth: CustomOAuth): OAuthAuth {
 			if (!credential.refresh) throw new Error(`${name}'s sign-in has no refresh token; sign in again`);
 			const response = await postOAuth(
 				oauth.tokenUrl,
+				// No scope: it's optional on a refresh (the sign-in's carries over), and some servers (Anthropic's)
+				// reject one.
 				{
 					grant_type: "refresh_token",
 					refresh_token: credential.refresh,
 					...(oauth.clientId ? { client_id: oauth.clientId } : {}),
-					...(oauth.scope ? { scope: oauth.scope } : {}),
 				},
 				oauth.format,
 				signal,

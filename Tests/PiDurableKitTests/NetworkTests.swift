@@ -98,7 +98,8 @@ extension MockServerTests {
         #expect(form.first { $0.name == "grant_type" }?.value == "refresh_token")
         #expect(form.first { $0.name == "refresh_token" }?.value == "first-refresh")
         #expect(form.first { $0.name == "client_id" }?.value == "client-1")
-        #expect(form.first { $0.name == "scope" }?.value == "chat")
+        // The sign-in's scope carries over; it isn't sent again.
+        #expect(form.first { $0.name == "scope" } == nil)
 
         let request = try #require(MockServer.requests(to: "subscription.test").last)
         #expect(request.header("Authorization") == "Bearer fresh-access")

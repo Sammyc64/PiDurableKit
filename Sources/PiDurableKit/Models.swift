@@ -424,7 +424,7 @@ public struct CustomProvider: Encodable, Sendable {
         public var tokenURL: URL
         /// The OAuth client, sent as `client_id`.
         public var clientID: String?
-        /// Sent as `scope`.
+        /// Sent as `scope` when signing in (not on refreshes, where the sign-in's carries over).
         public var scope: String?
         /// Added to the authorization URL (browser) or the device authorization request (device code).
         public var parameters: [String: String]
