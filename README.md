@@ -502,6 +502,20 @@ credential stays until `models.logout(from:)`.
 Headers work as in pi-ai: a model's `headers` (inheriting its provider's) go with that model's requests, and
 `Settings.Stream.headers` go with every request.
 
+A custom provider can also use OAuth tokens from a sign-in made elsewhere instead of an API key. Give it a
+`tokenRefresh` (an OAuth 2 token endpoint) and store the tokens; requests send the access token as the key and refresh
+it with a `refresh_token` grant before it expires, as the built-in sign-ins do:
+
+```swift
+try await models.register(CustomProvider(
+    id: "service", baseURL: URL(string: "https://api.example.com/v1")!, api: .openAIResponses,
+    tokenRefresh: .init(tokenURL: URL(string: "https://auth.example.com/oauth/token")!, clientID: "…"),  // format: .json
+    models: [.init(id: "model")]))
+try await models.setCredential(.oauth(accessToken: access, refreshToken: refresh, expiresAt: expiry), for: "service")
+```
+
+`ProviderInfo.acceptsAPIKey` says which providers take an API key; some built-in ones only have a sign-in.
+
 > Shipping provider API keys inside an app exposes them to anyone who inspects it. For production, point a `CustomProvider` (or `Settings.Stream.headers`) at your own backend proxy.
 
 ### Apple Foundation Models

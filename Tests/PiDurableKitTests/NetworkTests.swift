@@ -64,6 +64,52 @@ extension MockServerTests {
         try await harness.close()
     }
 
+    /// A custom provider used with tokens from a sign-in made elsewhere: an expired access token is refreshed through
+    /// its token URL before the request, which sends the new one.
+    @Test func customProviderTokensRefresh() async throws {
+        MockServer.handle(host: "tokens.test") { _ in
+            .init(
+                headers: ["content-type": "application/json"],
+                chunks: [#"{"access_token":"fresh-access","refresh_token":"next-refresh","expires_in":3600,"token_type":"Bearer"}"#])
+        }
+        MockServer.handle(host: "subscription.test") { _ in
+            .init(chunks: [
+                .sse(#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Refreshed"},"finish_reason":"stop"}]}"#),
+                "data: [DONE]\n\n",
+            ])
+        }
+        let models = Models(builtinProviders: false, runtime: Self.runtime)
+        try await models.register(CustomProvider(
+            id: "subscription", baseURL: URL(string: "https://subscription.test/v1")!,
+            headers: ["x-client": "example"],
+            tokenRefresh: .init(tokenURL: URL(string: "https://tokens.test/oauth/token")!, clientID: "client-1", scope: "chat"),
+            models: [.init(id: "m")]))
+        try await models.setCredential(
+            .oauth(accessToken: "stale-access", refreshToken: "first-refresh", expiresAt: .distantPast), for: "subscription")
+        #expect(try await models.providers().first?.acceptsAPIKey == true)
+
+        let harness = try await Harness.open(models: models)
+        let root = try await harness.root(agent: AgentChange(model: ModelRef(provider: "subscription", modelId: "m")))
+        #expect(try await ask(root, "Hi").text == "Refreshed")
+
+        let grant = try #require(MockServer.requests(to: "tokens.test").last)
+        #expect(grant.header("Content-Type") == "application/x-www-form-urlencoded")
+        let form = URLComponents(string: "?" + String(decoding: grant.body, as: UTF8.self))?.queryItems ?? []
+        #expect(form.first { $0.name == "grant_type" }?.value == "refresh_token")
+        #expect(form.first { $0.name == "refresh_token" }?.value == "first-refresh")
+        #expect(form.first { $0.name == "client_id" }?.value == "client-1")
+        #expect(form.first { $0.name == "scope" }?.value == "chat")
+
+        let request = try #require(MockServer.requests(to: "subscription.test").last)
+        #expect(request.header("Authorization") == "Bearer fresh-access")
+        #expect(request.header("x-client") == "example")
+        let stored = try #require(try await models.credential(for: "subscription"))
+        #expect(stored.kind == .oauth)
+        #expect(stored.json["refresh"] == "next-refresh")
+        #expect((stored.expiresAt ?? .distantPast) > .now)
+        try await harness.close()
+    }
+
     @Test func unregisteringAProvider() async throws {
         let models = Models(builtinProviders: false, runtime: Self.runtime)
         try await models.register(CustomProvider(

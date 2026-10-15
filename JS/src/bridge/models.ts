@@ -16,6 +16,8 @@ import {
 	getSupportedThinkingLevels,
 	type Model,
 	type MutableModels,
+	type OAuthAuth,
+	type OAuthCredential,
 	type ProviderStreams,
 } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
@@ -126,6 +128,56 @@ function describeModel(model: Model<string>) {
 }
 
 /** pi-ai's chat API implementations a custom provider can use, by `model.api`. */
+/** How a custom provider's tokens refresh (`CustomProvider.TokenRefresh`): an OAuth 2 refresh-token grant. */
+interface TokenRefresh {
+	tokenUrl: string;
+	clientId: string | null;
+	scope: string | null;
+	/** How the grant is sent: `form` (`application/x-www-form-urlencoded`, as OAuth 2 has it) or `json`. */
+	format: "form" | "json";
+}
+
+/**
+ * OAuth auth for a custom provider whose tokens were stored with `Models.setCredential` (there's no sign-in flow):
+ * pi-ai's `Models` refreshes them through `tokenUrl` before they expire, and requests send the access token as the
+ * API key.
+ */
+function tokenRefreshAuth(name: string, refresh: TokenRefresh): OAuthAuth {
+	return {
+		name,
+		login: async () => {
+			throw new Error(`${name} has no sign-in; store its tokens instead`);
+		},
+		refresh: async (credential, signal) => {
+			const grant: Record<string, string> = { grant_type: "refresh_token", refresh_token: credential.refresh };
+			if (refresh.clientId) grant.client_id = refresh.clientId;
+			if (refresh.scope) grant.scope = refresh.scope;
+			const json = refresh.format === "json";
+			const response = await fetch(refresh.tokenUrl, {
+				method: "POST",
+				headers: { "content-type": json ? "application/json" : "application/x-www-form-urlencoded", accept: "application/json" },
+				body: json ? JSON.stringify(grant) : new URLSearchParams(grant).toString(),
+				signal,
+			});
+			const text = await response.text();
+			if (!response.ok) throw new Error(`Token refresh failed (${response.status}): ${text.slice(0, 500)}`);
+			const body = JSON.parse(text) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
+			if (typeof body.access_token !== "string") throw new Error("Token refresh returned no access_token");
+			const expiresIn = typeof body.expires_in === "number" ? body.expires_in : 3600;
+			return {
+				...credential,
+				type: "oauth",
+				access: body.access_token,
+				// Servers that don't rotate refresh tokens leave it out: keep the one there is.
+				refresh: typeof body.refresh_token === "string" ? body.refresh_token : credential.refresh,
+				// A minute early, so a request never goes out with a token about to lapse.
+				expires: Date.now() + Math.max(expiresIn - 60, 0) * 1000,
+			} satisfies OAuthCredential;
+		},
+		toAuth: async (credential) => ({ apiKey: credential.access }),
+	};
+}
+
 const apis: Record<string, () => ProviderStreams> = {
 	"anthropic-messages": anthropicMessagesApi,
 	"azure-openai-responses": azureOpenAIResponsesApi,
@@ -218,6 +270,11 @@ register({
 		if (args.key === null) await credentials.delete(args.provider);
 		else await credentials.modify(args.provider, async () => ({ type: "api_key", key: args.key }) as never);
 	},
+	"models.setCredential": async (args) => {
+		const { credentials } = modelsState(args.id);
+		if (args.credential === null) await credentials.delete(args.provider);
+		else await credentials.modify(args.provider, async () => args.credential as never);
+	},
 	"models.list": (args) => {
 		const { models } = modelsState(args.id);
 		return models.getModels(args.provider ?? undefined).map(describeModel);
@@ -228,6 +285,7 @@ register({
 			.map((provider) => ({
 				id: provider.id,
 				name: provider.name ?? provider.id,
+				acceptsAPIKey: provider.auth.apiKey !== undefined,
 				oauth:
 					provider.auth.oauth === undefined
 						? null
@@ -295,6 +353,7 @@ register({
 					apiKey: keyless
 						? { name: spec.name ?? spec.id, resolve: async () => ({ auth: { apiKey: "unused" } }) }
 						: envApiKeyAuth(spec.name ?? spec.id, []),
+					...(spec.tokenRefresh ? { oauth: tokenRefreshAuth(spec.name ?? spec.id, spec.tokenRefresh as TokenRefresh) } : {}),
 				},
 				models: models as never,
 				api: api as never,
