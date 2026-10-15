@@ -14,13 +14,63 @@ public final class Runtime: Sendable {
         public var urlSessionConfiguration: URLSessionConfiguration
         /// Receives JavaScript console output. Defaults to `os.Logger`.
         public var log: (@Sendable (LogLevel, String) -> Void)?
+        /// How the app identifies itself to model providers. Defaults to ``Client/app``.
+        public var client: Client
 
         public init(
             urlSessionConfiguration: URLSessionConfiguration = .default,
-            log: (@Sendable (LogLevel, String) -> Void)? = nil
+            log: (@Sendable (LogLevel, String) -> Void)? = nil,
+            client: Client = .app
         ) {
             self.urlSessionConfiguration = urlSessionConfiguration
             self.log = log
+            self.client = client
+        }
+    }
+
+    /// How an app identifies itself to model providers, wherever pi-ai would say "pi": the `User-Agent` of every
+    /// provider request, the name a sign-in introduces the app by (OpenAI's sign-in page shows it), and the
+    /// originator or referrer a provider records it as (OpenAI Codex, xAI).
+    public struct Client: Sendable, Hashable {
+        /// The app's name, such as "Pelican".
+        public var name: String
+        /// The app's version, such as "1.2", for the `User-Agent`.
+        public var version: String?
+
+        public init(name: String, version: String? = nil) {
+            self.name = name
+            self.version = version
+        }
+
+        /// The app, as its bundle names it (its display name, or else its name) with its version.
+        public static let app: Client = {
+            let info = Bundle.main.infoDictionary ?? [:]
+            let name = (info["CFBundleDisplayName"] as? String) ?? (info["CFBundleName"] as? String)
+                ?? ProcessInfo.processInfo.processName
+            return Client(name: name, version: info["CFBundleShortVersionString"] as? String)
+        }()
+
+        /// `Name/version (system version)`, such as `Pelican/1.2 (iOS 27.0)`: a product token (the name without
+        /// spaces) and the operating system.
+        public var userAgent: String {
+            let product = name.split(whereSeparator: \.isWhitespace).joined(separator: "-")
+            let os = ProcessInfo.processInfo.operatingSystemVersion
+            let system = "\(Self.systemName) \(os.majorVersion).\(os.minorVersion)" + (os.patchVersion > 0 ? ".\(os.patchVersion)" : "")
+            return "\(product)\(version.map { "/\($0)" } ?? "") (\(system))"
+        }
+
+        private static var systemName: String {
+            #if os(visionOS)
+            "visionOS"
+            #elseif os(tvOS)
+            "tvOS"
+            #elseif os(watchOS)
+            "watchOS"
+            #elseif os(iOS)
+            ProcessInfo.processInfo.isiOSAppOnMac ? "macOS" : "iOS"
+            #else
+            "macOS"
+            #endif
         }
     }
 
@@ -339,6 +389,13 @@ actor Engine {
         define("now", {
             Date().timeIntervalSince1970 * 1000
         } as @convention(block) () -> Double)
+
+        let client = configuration.client
+        let clientJSON = (try? String(
+            decoding: JSONEncoder().encode(["name": client.name, "userAgent": client.userAgent]), as: UTF8.self)) ?? "{}"
+        define("client", {
+            clientJSON
+        } as @convention(block) () -> String)
 
         define("setTimer", { [unowned self] (id: Int, delay: Double) in
             self.isolated { $0.setTimer(id: id, delay: delay) }

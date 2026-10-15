@@ -613,6 +613,8 @@ let root = try await harness.root(agent: AgentChange(model: faux.model))
 
 Use `Runtime(configuration:)` to give agents their own JavaScript thread or a custom `URLSessionConfiguration`, and pass it to `Models(runtime:)`.
 
+Providers see the app, not pi: requests carry its `User-Agent` (`Pelican/1.2 (iOS 27.0)`), and OpenAI's sign-in, OpenAI Codex's originator and xAI's referrer use its name, where pi-ai would say "pi". `Runtime.Client` holds them, from the app's bundle by default; set `Runtime.Configuration.client` to change them. `JS/build.mjs` routes pi-ai's `utils/pi-user-agent.js` to `JS/src/shims/client.ts` and patches the other places, failing the build if an update moves them. Radius's OAuth client ID (`pi-gateway`) stays: it's the ID Radius knows.
+
 ## Updating pi-durable
 
 The bundled versions are pinned exactly in `JS/package.json` and exposed as `PiDurable.version`, `PiDurable.piAIVersion`, `PiDurable.chordVersion`, and `PiDurable.piCodemodeVersion`.

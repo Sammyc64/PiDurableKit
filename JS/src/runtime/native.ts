@@ -5,6 +5,8 @@
 export interface NativeHost {
 	log(level: "debug" | "info" | "warn" | "error", message: string): void;
 	now(): number;
+	/** How the app identifies itself to providers: `{"name": …, "userAgent": …}` JSON (`Runtime.Client`). */
+	client(): string;
 
 	setTimer(id: number, delayMs: number): void;
 	clearTimer(id: number): void;

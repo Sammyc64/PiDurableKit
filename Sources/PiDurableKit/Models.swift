@@ -109,7 +109,7 @@ public final class Models: Sendable {
     ///   - installationID: A stable ID of this app installation. Sign in with ChatGPT registers it with OpenAI as the
     ///     agent host. Defaults to ``Models/installationID``.
     ///   - agentName: How the app introduces itself to providers whose sign-in pages show it, such as OpenAI's. Defaults
-    ///     to pi-ai's ("pi").
+    ///     to the runtime's ``Runtime/Client/name``.
     public func login(
         to provider: ProviderID, interaction: LoginInteraction, installationID: UUID = Models.installationID,
         agentName: String? = nil

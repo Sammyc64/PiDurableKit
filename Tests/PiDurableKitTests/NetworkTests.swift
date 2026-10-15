@@ -41,6 +41,29 @@ extension MockServerTests {
         try await harness.close()
     }
 
+    /// Provider requests say which app they're from (`Runtime.Client`), not "pi".
+    @Test func requestsCarryTheAppsUserAgent() async throws {
+        MockServer.handle(host: "agent.test") { _ in
+            .init(chunks: [
+                .sse(#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop"}]}"#),
+                "data: [DONE]\n\n",
+            ])
+        }
+        let client = Runtime.Client(name: "Example App", version: "2.1")
+        let runtime = Runtime(configuration: .init(urlSessionConfiguration: MockServer.configuration, client: client))
+        let models = Models(builtinProviders: false, runtime: runtime)
+        try await models.register(CustomProvider(
+            id: "agent", baseURL: URL(string: "https://agent.test/v1")!, apiKey: "secret", models: [.init(id: "m")]))
+        let harness = try await Harness.open(models: models)
+        let root = try await harness.root(agent: AgentChange(model: ModelRef(provider: "agent", modelId: "m")))
+        #expect(try await ask(root, "Hi").text == "Hi")
+
+        let request = try #require(MockServer.requests(to: "agent.test").last)
+        #expect(request.header("User-Agent") == client.userAgent)
+        #expect(client.userAgent.hasPrefix("Example-App/2.1 ("))
+        try await harness.close()
+    }
+
     @Test func unregisteringAProvider() async throws {
         let models = Models(builtinProviders: false, runtime: Self.runtime)
         try await models.register(CustomProvider(

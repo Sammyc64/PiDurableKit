@@ -132,6 +132,27 @@ extension MockServerTests {
         try await harness.close()
     }
 
+    /// Without an `agentName`, a sign-in introduces the app by its client name.
+    @Test func signInWithChatGPTUsesTheClientName() async throws {
+        MockServer.handle(host: "auth.openai.com") { _ in
+            .init(
+                headers: ["content-type": "application/json"],
+                chunks: [#"{"access_token":"chatgpt-access","refresh_token":"chatgpt-refresh","id_token":"id","expires_in":3600,"scope":"openid profile email offline_access resource.invoke chatgpt.tokens.use.direct","token_type":"Bearer"}"#])
+        }
+        let authorizeURL = Mutex<URL?>(nil)
+        let runtime = Runtime(configuration: .init(
+            urlSessionConfiguration: MockServer.configuration, client: .init(name: "Example", version: "2.1")))
+        let models = Models(runtime: runtime)
+        let interaction = Self.browser(
+            code: "chatgpt-code", extra: [URLQueryItem(name: "client_id", value: "issued-client")],
+            onAuthorize: { authorizeURL.set($0) })
+        try await withTimeout {
+            try await models.login(to: .openAI, interaction: interaction, installationID: UUID())
+        }
+        let authorize = try #require(authorizeURL.get().flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) })
+        #expect(authorize.queryItems?.first { $0.name == "agent_name_hint" }?.value == "Example")
+    }
+
     @Test func expiredTokensRefreshBeforeRequests() async throws {
         Self.serveTokens(access: "sk-ant-oat01-access-2", refresh: "refresh-2")
         Self.serveAnthropicMessages()
