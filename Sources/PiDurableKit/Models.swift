@@ -85,7 +85,7 @@ public final class Models: Sendable {
 
     /// Stores (or with `nil`, removes) a provider's credential as it is: an API key, or OAuth tokens from a sign-in
     /// made elsewhere (``Credential/oauth(accessToken:refreshToken:expiresAt:)``). A provider refreshes OAuth tokens
-    /// if it can: a built-in one with a sign-in, or a ``CustomProvider`` with ``CustomProvider/tokenRefresh``.
+    /// if it can: a built-in one with a sign-in, or a ``CustomProvider`` with ``CustomProvider/oauth``.
     public func setCredential(_ credential: Credential?, for provider: ProviderID) async throws {
         try await perform("models.setCredential", ["provider": provider, "credential": credential])
     }
@@ -392,32 +392,53 @@ public struct CustomProvider: Encodable, Sendable {
     public var apiKey: String?
     /// HTTP headers sent with every request to this provider's models.
     public var headers: [String: String]?
-    /// How the provider's OAuth tokens refresh, for a provider used with tokens rather than an API key.
-    public var tokenRefresh: TokenRefresh?
+    /// How the provider signs in with OAuth, for a provider used with OAuth tokens rather than an API key.
+    public var oauth: OAuth?
     public var models: [Model]
 
-    /// An OAuth 2 token endpoint that refreshes a provider's tokens. Store the tokens with
-    /// ``Models/setCredential(_:for:)`` (``Credential/oauth(accessToken:refreshToken:expiresAt:)``); requests send the
-    /// access token as the API key, and refresh it with a `refresh_token` grant before it expires.
-    public struct TokenRefresh: Encodable, Sendable, Hashable {
-        /// How the grant is sent.
+    /// A provider's OAuth 2: how it signs in (``Models/login(to:interaction:installationID:agentName:)``), in the
+    /// browser with PKCE and a loopback redirect or with a device code, and the token endpoint that exchanges and
+    /// refreshes its tokens. Requests send the access token as the API key, and refresh it with a `refresh_token`
+    /// grant before it expires.
+    ///
+    /// Without a sign-in, store tokens from a sign-in made elsewhere with ``Models/setCredential(_:for:)``
+    /// (``Credential/oauth(accessToken:refreshToken:expiresAt:)``).
+    public struct OAuth: Encodable, Sendable, Hashable {
+        /// How token requests are sent.
         public enum Format: String, Encodable, Sendable {
             /// `application/x-www-form-urlencoded`, as OAuth 2 has it.
             case form
             case json
         }
 
+        /// How a sign-in goes.
+        public enum SignIn: Sendable, Hashable {
+            /// The authorization page in the browser (``LoginInteraction/presentSignInPage``), with PKCE; its
+            /// redirect, a loopback address with a port (`http://localhost:1455/callback`), comes back to the app.
+            case browser(authorizationURL: URL, redirectURI: URL)
+            /// A code to enter on the provider's page (RFC 8628), shown with ``LoginInteraction``'s device code.
+            case deviceCode(deviceAuthorizationURL: URL)
+        }
+
+        public var signIn: SignIn?
         public var tokenURL: URL
-        /// The OAuth client the tokens were issued to, sent as `client_id`.
+        /// The OAuth client, sent as `client_id`.
         public var clientID: String?
-        /// Sent as `scope`, for servers that want it on a refresh.
+        /// Sent as `scope`.
         public var scope: String?
+        /// Added to the authorization URL (browser) or the device authorization request (device code).
+        public var parameters: [String: String]
         public var format: Format
 
-        public init(tokenURL: URL, clientID: String? = nil, scope: String? = nil, format: Format = .form) {
+        public init(
+            signIn: SignIn?, tokenURL: URL, clientID: String? = nil, scope: String? = nil, parameters: [String: String] = [:],
+            format: Format = .form
+        ) {
+            self.signIn = signIn
             self.tokenURL = tokenURL
             self.clientID = clientID
             self.scope = scope
+            self.parameters = parameters
             self.format = format
         }
 
@@ -426,13 +447,24 @@ public struct CustomProvider: Encodable, Sendable {
             try container.encode(tokenURL.absoluteString, forKey: AnyKey("tokenUrl"))
             try container.encode(clientID, forKey: AnyKey("clientId"))
             try container.encode(scope, forKey: AnyKey("scope"))
+            try container.encode(parameters, forKey: AnyKey("parameters"))
             try container.encode(format, forKey: AnyKey("format"))
+            switch signIn {
+            case .browser(let authorizationURL, let redirectURI)?:
+                try container.encode(
+                    ["type": "browser", "authorizationUrl": authorizationURL.absoluteString, "redirectUri": redirectURI.absoluteString],
+                    forKey: AnyKey("signIn"))
+            case .deviceCode(let url)?:
+                try container.encode(["type": "deviceCode", "deviceAuthorizationUrl": url.absoluteString], forKey: AnyKey("signIn"))
+            case nil:
+                try container.encodeNil(forKey: AnyKey("signIn"))
+            }
         }
     }
 
     public init(
         id: ProviderID, name: String? = nil, baseURL: URL, api: API = .openAICompletions, apiKey: String? = nil,
-        headers: [String: String]? = nil, tokenRefresh: TokenRefresh? = nil, models: [Model]
+        headers: [String: String]? = nil, oauth: OAuth? = nil, models: [Model]
     ) {
         self.id = id
         self.name = name
@@ -440,7 +472,7 @@ public struct CustomProvider: Encodable, Sendable {
         self.api = api
         self.apiKey = apiKey
         self.headers = headers
-        self.tokenRefresh = tokenRefresh
+        self.oauth = oauth
         self.models = models
     }
 
@@ -452,7 +484,7 @@ public struct CustomProvider: Encodable, Sendable {
         try container.encode(api, forKey: AnyKey("api"))
         try container.encodeIfPresent(apiKey, forKey: AnyKey("apiKey"))
         try container.encodeIfPresent(headers, forKey: AnyKey("headers"))
-        try container.encodeIfPresent(tokenRefresh, forKey: AnyKey("tokenRefresh"))
+        try container.encodeIfPresent(oauth, forKey: AnyKey("oauth"))
         try container.encode(models, forKey: AnyKey("models"))
     }
 }

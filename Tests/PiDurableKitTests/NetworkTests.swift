@@ -82,7 +82,7 @@ extension MockServerTests {
         try await models.register(CustomProvider(
             id: "subscription", baseURL: URL(string: "https://subscription.test/v1")!,
             headers: ["x-client": "example"],
-            tokenRefresh: .init(tokenURL: URL(string: "https://tokens.test/oauth/token")!, clientID: "client-1", scope: "chat"),
+            oauth: .init(signIn: nil, tokenURL: URL(string: "https://tokens.test/oauth/token")!, clientID: "client-1", scope: "chat"),
             models: [.init(id: "m")]))
         try await models.setCredential(
             .oauth(accessToken: "stale-access", refreshToken: "first-refresh", expiresAt: .distantPast), for: "subscription")

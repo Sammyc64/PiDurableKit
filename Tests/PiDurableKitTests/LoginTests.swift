@@ -153,6 +153,95 @@ extension MockServerTests {
         #expect(authorize.queryItems?.first { $0.name == "agent_name_hint" }?.value == "Example")
     }
 
+    /// A custom provider's browser sign-in: the authorization page with PKCE and the client's settings, its redirect
+    /// caught on the loopback port, and the code exchanged at the token URL.
+    @Test func customProviderBrowserSignIn() async throws {
+        MockServer.handle(host: "auth.custom.test") { _ in
+            .init(
+                headers: ["content-type": "application/json"],
+                chunks: [#"{"access_token":"custom-access","refresh_token":"custom-refresh","expires_in":3600}"#])
+        }
+        let authorizeURL = Mutex<URL?>(nil)
+        let models = Models(builtinProviders: false, runtime: Self.runtime)
+        try await models.register(CustomProvider(
+            id: "custom", name: "Custom", baseURL: URL(string: "https://api.custom.test/v1")!,
+            oauth: .init(
+                signIn: .browser(
+                    authorizationURL: URL(string: "https://auth.custom.test/authorize")!,
+                    redirectURI: URL(string: "http://localhost:51234/callback")!),
+                tokenURL: URL(string: "https://auth.custom.test/token")!, clientID: "custom-client", scope: "chat offline",
+                parameters: ["prompt": "consent"], format: .json),
+            models: [.init(id: "m")]))
+        #expect(try await models.providers().first?.oauth != nil)
+
+        let interaction = Self.browser(code: "custom-code", onAuthorize: { authorizeURL.set($0) })
+        try await withTimeout { try await models.login(to: "custom", interaction: interaction) }
+
+        let authorize = try #require(authorizeURL.get().flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) })
+        let query = Dictionary(uniqueKeysWithValues: (authorize.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+        #expect(authorize.host == "auth.custom.test" && authorize.path == "/authorize")
+        #expect(query["client_id"] == "custom-client")
+        #expect(query["scope"]?.replacingOccurrences(of: "+", with: " ") == "chat offline")
+        #expect(query["redirect_uri"] == "http://localhost:51234/callback")
+        #expect(query["code_challenge_method"] == "S256")
+        #expect(query["prompt"] == "consent")
+
+        let exchange = try #require(MockServer.requests(to: "auth.custom.test").last)
+        #expect(exchange.json?["grant_type"] == "authorization_code")
+        #expect(exchange.json?["code"] == "custom-code")
+        #expect(exchange.json?["client_id"] == "custom-client")
+        #expect(exchange.json?["state"] == JSONValue.string(query["state"] ?? ""))
+        let credential = try #require(try await models.credential(for: "custom"))
+        #expect(credential.kind == .oauth)
+        #expect(credential.json["access"] == "custom-access")
+        #expect(credential.json["refresh"] == "custom-refresh")
+    }
+
+    /// A custom provider's device-code sign-in: the code reported to the app, then the token URL polled until it
+    /// stops saying `authorization_pending`.
+    @Test func customProviderDeviceCodeSignIn() async throws {
+        let polls = Mutex(0)
+        MockServer.handle(host: "device.custom.test") { request in
+            if request.url.path() == "/device" {
+                return .init(
+                    headers: ["content-type": "application/json"],
+                    chunks: [#"{"device_code":"dev-1","user_code":"ABCD-EFGH","verification_uri":"https://device.custom.test/activate","interval":1,"expires_in":60}"#])
+            }
+            polls.update { $0 += 1 }
+            let attempt = polls.get()
+            if attempt == 1 {
+                return .init(status: 400, headers: ["content-type": "application/json"], chunks: [#"{"error":"authorization_pending"}"#])
+            }
+            return .init(
+                headers: ["content-type": "application/json"],
+                chunks: [#"{"access_token":"device-access","refresh_token":"device-refresh","expires_in":3600}"#])
+        }
+        let reported = Mutex<String?>(nil)
+        let models = Models(builtinProviders: false, runtime: Self.runtime)
+        try await models.register(CustomProvider(
+            id: "device", baseURL: URL(string: "https://api.custom.test/v1")!,
+            oauth: .init(
+                signIn: .deviceCode(deviceAuthorizationURL: URL(string: "https://device.custom.test/device")!),
+                tokenURL: URL(string: "https://device.custom.test/token")!, clientID: "device-client", scope: "chat"),
+            models: [.init(id: "m")]))
+        let interaction = LoginInteraction(
+            presentSignInPage: { _ in while !Task.isCancelled { try await Task.sleep(for: .milliseconds(20)) } },
+            notify: { event in if case .deviceCode(let code, _) = event { reported.set(code) } })
+        try await withTimeout(20) { try await models.login(to: "device", interaction: interaction) }
+
+        #expect(reported.get() == "ABCD-EFGH")
+        let requests = MockServer.requests(to: "device.custom.test")
+        let device = try #require(requests.first { $0.url.path() == "/device" })
+        let deviceForm = URLComponents(string: "?" + String(decoding: device.body, as: UTF8.self))?.queryItems ?? []
+        #expect(deviceForm.first { $0.name == "client_id" }?.value == "device-client")
+        let poll = try #require(requests.last { $0.url.path() == "/token" })
+        let pollForm = URLComponents(string: "?" + String(decoding: poll.body, as: UTF8.self))?.queryItems ?? []
+        #expect(pollForm.first { $0.name == "grant_type" }?.value == "urn:ietf:params:oauth:grant-type:device_code")
+        #expect(pollForm.first { $0.name == "device_code" }?.value == "dev-1")
+        #expect(polls.get() == 2)
+        #expect(try await models.credential(for: "device")?.json["access"] == "device-access")
+    }
+
     @Test func expiredTokensRefreshBeforeRequests() async throws {
         Self.serveTokens(access: "sk-ant-oat01-access-2", refresh: "refresh-2")
         Self.serveAnthropicMessages()

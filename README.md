@@ -502,17 +502,23 @@ credential stays until `models.logout(from:)`.
 Headers work as in pi-ai: a model's `headers` (inheriting its provider's) go with that model's requests, and
 `Settings.Stream.headers` go with every request.
 
-A custom provider can also use OAuth tokens from a sign-in made elsewhere instead of an API key. Give it a
-`tokenRefresh` (an OAuth 2 token endpoint) and store the tokens; requests send the access token as the key and refresh
-it with a `refresh_token` grant before it expires, as the built-in sign-ins do:
+A custom provider can sign in with OAuth instead of an API key. Give it an `oauth` (a browser sign-in with PKCE and a
+loopback redirect, or a device code, and the token endpoint) and sign in with `models.login(to:interaction:)`, as for
+the built-in sign-ins; requests send the access token as the key and refresh it before it expires:
 
 ```swift
 try await models.register(CustomProvider(
     id: "service", baseURL: URL(string: "https://api.example.com/v1")!, api: .openAIResponses,
-    tokenRefresh: .init(tokenURL: URL(string: "https://auth.example.com/oauth/token")!, clientID: "…"),  // format: .json
+    oauth: .init(
+        signIn: .browser(authorizationURL: URL(string: "https://auth.example.com/authorize")!,
+                         redirectURI: URL(string: "http://localhost:1455/callback")!),   // or .deviceCode(deviceAuthorizationURL:)
+        tokenURL: URL(string: "https://auth.example.com/oauth/token")!, clientID: "…", scope: "…"),
     models: [.init(id: "model")]))
-try await models.setCredential(.oauth(accessToken: access, refreshToken: refresh, expiresAt: expiry), for: "service")
+try await models.login(to: "service", interaction: .webAuthenticationSession())
 ```
+
+With `signIn: nil`, store tokens from a sign-in made elsewhere instead:
+`models.setCredential(.oauth(accessToken:refreshToken:expiresAt:), for: "service")`.
 
 `ProviderInfo.acceptsAPIKey` says which providers take an API key; some built-in ones only have a sign-in.
 

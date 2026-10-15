@@ -18,8 +18,14 @@ import {
 	type MutableModels,
 	type OAuthAuth,
 	type OAuthCredential,
+	type ProviderAuthInteraction,
 	type ProviderStreams,
 } from "@earendil-works/pi-ai";
+// pi-ai's own sign-in pieces, which its package doesn't export: the loopback redirect server (Network.framework, through
+// the node:http shim), PKCE, and the device-code poller.
+import { startOAuthCallbackServer } from "../../node_modules/@earendil-works/pi-ai/dist/auth/oauth/callback-server.js";
+import { pollOAuthDeviceCodeFlow } from "../../node_modules/@earendil-works/pi-ai/dist/auth/oauth/device-code.js";
+import { generatePKCE } from "../../node_modules/@earendil-works/pi-ai/dist/auth/oauth/pkce.js";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
 import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
@@ -128,51 +134,214 @@ function describeModel(model: Model<string>) {
 }
 
 /** pi-ai's chat API implementations a custom provider can use, by `model.api`. */
-/** How a custom provider's tokens refresh (`CustomProvider.TokenRefresh`): an OAuth 2 refresh-token grant. */
-interface TokenRefresh {
+/**
+ * A custom provider's OAuth (`CustomProvider.OAuth`): how it signs in, if it does (a browser sign-in with PKCE and a
+ * loopback redirect, or a device code), and the token endpoint that exchanges and refreshes its tokens.
+ */
+interface CustomOAuth {
 	tokenUrl: string;
 	clientId: string | null;
 	scope: string | null;
-	/** How the grant is sent: `form` (`application/x-www-form-urlencoded`, as OAuth 2 has it) or `json`. */
+	/** How token requests are sent: `form` (`application/x-www-form-urlencoded`, as OAuth 2 has it) or `json`. */
 	format: "form" | "json";
+	/** Added to the authorization URL (browser) or the device authorization request (device code). */
+	parameters: Record<string, string>;
+	signIn:
+		| { type: "browser"; authorizationUrl: string; redirectUri: string }
+		| { type: "deviceCode"; deviceAuthorizationUrl: string }
+		| null;
+}
+
+/** An OAuth endpoint's JSON response, or its error. */
+async function postOAuth(
+	url: string,
+	fields: Record<string, string>,
+	format: "form" | "json",
+	signal: AbortSignal,
+): Promise<{ ok: boolean; status: number; body: Record<string, unknown>; text: string }> {
+	const json = format === "json";
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { "content-type": json ? "application/json" : "application/x-www-form-urlencoded", accept: "application/json" },
+		body: json ? JSON.stringify(fields) : new URLSearchParams(fields).toString(),
+		signal,
+	});
+	const text = await response.text();
+	let body: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(text) as unknown;
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
+	} catch {
+		// Not JSON: the text says what went wrong.
+	}
+	return { ok: response.ok, status: response.status, body, text };
+}
+
+function oauthFailure(action: string, response: { status: number; body: Record<string, unknown>; text: string }): Error {
+	const error = typeof response.body.error === "string" ? response.body.error : undefined;
+	const description = typeof response.body.error_description === "string" ? response.body.error_description : undefined;
+	const detail = [error, description].filter(Boolean).join(": ") || response.text.slice(0, 300);
+	return new Error(`${action} failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
+}
+
+/** Tokens from a token endpoint's response; servers that don't rotate refresh tokens leave theirs out. */
+function oauthCredential(body: Record<string, unknown>, previous?: OAuthCredential): OAuthCredential {
+	if (typeof body.access_token !== "string" || body.access_token === "") throw new Error("The token endpoint returned no access_token");
+	const expiresIn = typeof body.expires_in === "number" && body.expires_in > 0 ? body.expires_in : 3600;
+	return {
+		...(previous ?? {}),
+		type: "oauth",
+		access: body.access_token,
+		refresh: typeof body.refresh_token === "string" ? body.refresh_token : (previous?.refresh ?? ""),
+		// A minute early, so a request never goes out with a token about to lapse.
+		expires: Date.now() + Math.max(expiresIn - 60, 0) * 1000,
+	};
+}
+
+/** A browser sign-in: the authorization page with PKCE, its redirect caught on a loopback port, the code exchanged. */
+async function browserSignIn(
+	name: string,
+	oauth: CustomOAuth,
+	signIn: { authorizationUrl: string; redirectUri: string },
+	interaction: ProviderAuthInteraction,
+): Promise<OAuthCredential> {
+	const redirect = new URL(signIn.redirectUri);
+	if (redirect.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(redirect.hostname) || !redirect.port) {
+		throw new Error("The redirect URI must be a loopback address with a port, like http://localhost:1455/callback");
+	}
+	const { verifier, challenge } = await generatePKCE();
+	const state = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+	const callback = await startOAuthCallbackServer({
+		providerName: name,
+		host: "127.0.0.1",
+		port: Number(redirect.port),
+		path: redirect.pathname,
+		redirectHost: redirect.hostname,
+		state,
+		complete: async (code: string) => code,
+		signal: interaction.signal,
+	});
+	try {
+		const url = new URL(signIn.authorizationUrl);
+		const query: Record<string, string> = {
+			response_type: "code",
+			redirect_uri: signIn.redirectUri,
+			code_challenge: challenge,
+			code_challenge_method: "S256",
+			state,
+			...(oauth.clientId ? { client_id: oauth.clientId } : {}),
+			...(oauth.scope ? { scope: oauth.scope } : {}),
+			...oauth.parameters,
+		};
+		for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value);
+		interaction.notify({ type: "auth_url", url: url.toString() });
+		const code = await callback.wait();
+		if (!code) throw new Error("Sign-in cancelled");
+		interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
+		const response = await postOAuth(
+			oauth.tokenUrl,
+			{
+				grant_type: "authorization_code",
+				code,
+				redirect_uri: signIn.redirectUri,
+				code_verifier: verifier,
+				// Some servers (Anthropic's) want the state back; others ignore it.
+				state,
+				...(oauth.clientId ? { client_id: oauth.clientId } : {}),
+			},
+			oauth.format,
+			interaction.signal,
+		);
+		if (!response.ok) throw oauthFailure("Token exchange", response);
+		return oauthCredential(response.body);
+	} finally {
+		callback.close();
+	}
+}
+
+/** A device-code sign-in (RFC 8628): a code to enter on the provider's page, then the token endpoint polled. */
+async function deviceCodeSignIn(
+	oauth: CustomOAuth,
+	signIn: { deviceAuthorizationUrl: string },
+	interaction: ProviderAuthInteraction,
+): Promise<OAuthCredential> {
+	const request: Record<string, string> = {
+		...(oauth.clientId ? { client_id: oauth.clientId } : {}),
+		...(oauth.scope ? { scope: oauth.scope } : {}),
+		...oauth.parameters,
+	};
+	const authorization = await postOAuth(signIn.deviceAuthorizationUrl, request, oauth.format, interaction.signal);
+	if (!authorization.ok) throw oauthFailure("Device authorization", authorization);
+	const body = authorization.body;
+	const deviceCode = body.device_code;
+	const userCode = body.user_code;
+	const page = body.verification_uri_complete ?? body.verification_uri ?? body.verification_url;
+	if (typeof deviceCode !== "string" || typeof userCode !== "string" || typeof page !== "string") {
+		throw new Error("The device authorization response is missing device_code, user_code or verification_uri");
+	}
+	if (new URL(page).protocol !== "https:") throw new Error("The device authorization response's page isn't https");
+	const intervalSeconds = typeof body.interval === "number" && body.interval > 0 ? body.interval : undefined;
+	const expiresInSeconds = typeof body.expires_in === "number" && body.expires_in > 0 ? body.expires_in : undefined;
+	interaction.notify({ type: "device_code", userCode, verificationUri: page, intervalSeconds, expiresInSeconds });
+	return pollOAuthDeviceCodeFlow<OAuthCredential>({
+		intervalSeconds,
+		expiresInSeconds,
+		waitBeforeFirstPoll: true,
+		signal: interaction.signal,
+		poll: async () => {
+			const response = await postOAuth(
+				oauth.tokenUrl,
+				{
+					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+					device_code: deviceCode,
+					...(oauth.clientId ? { client_id: oauth.clientId } : {}),
+				},
+				oauth.format,
+				interaction.signal,
+			);
+			if (response.ok) return { status: "complete", value: oauthCredential(response.body) };
+			const error = response.body.error;
+			if (error === "authorization_pending") return { status: "pending" };
+			if (error === "slow_down") {
+				const interval = response.body.interval;
+				return { status: "slow_down", intervalSeconds: typeof interval === "number" ? interval : undefined };
+			}
+			return { status: "failed", message: oauthFailure("Sign-in", response).message };
+		},
+	});
 }
 
 /**
- * OAuth auth for a custom provider whose tokens were stored with `Models.setCredential` (there's no sign-in flow):
- * pi-ai's `Models` refreshes them through `tokenUrl` before they expire, and requests send the access token as the
- * API key.
+ * OAuth auth for a custom provider: signing in in the browser or with a device code, or with tokens stored with
+ * `Models.setCredential` when it has no sign-in. pi-ai's `Models` refreshes the tokens through `tokenUrl` before they
+ * expire, and requests send the access token as the API key.
  */
-function tokenRefreshAuth(name: string, refresh: TokenRefresh): OAuthAuth {
+function customOAuthAuth(name: string, oauth: CustomOAuth): OAuthAuth {
 	return {
 		name,
-		login: async () => {
-			throw new Error(`${name} has no sign-in; store its tokens instead`);
+		loginLabel: `Sign in to ${name}`,
+		login: async (interaction) => {
+			const signIn = oauth.signIn;
+			if (signIn === null) throw new Error(`${name} has no sign-in; store its tokens instead`);
+			return signIn.type === "browser"
+				? browserSignIn(name, oauth, signIn, interaction)
+				: deviceCodeSignIn(oauth, signIn, interaction);
 		},
 		refresh: async (credential, signal) => {
-			const grant: Record<string, string> = { grant_type: "refresh_token", refresh_token: credential.refresh };
-			if (refresh.clientId) grant.client_id = refresh.clientId;
-			if (refresh.scope) grant.scope = refresh.scope;
-			const json = refresh.format === "json";
-			const response = await fetch(refresh.tokenUrl, {
-				method: "POST",
-				headers: { "content-type": json ? "application/json" : "application/x-www-form-urlencoded", accept: "application/json" },
-				body: json ? JSON.stringify(grant) : new URLSearchParams(grant).toString(),
+			if (!credential.refresh) throw new Error(`${name}'s sign-in has no refresh token; sign in again`);
+			const response = await postOAuth(
+				oauth.tokenUrl,
+				{
+					grant_type: "refresh_token",
+					refresh_token: credential.refresh,
+					...(oauth.clientId ? { client_id: oauth.clientId } : {}),
+					...(oauth.scope ? { scope: oauth.scope } : {}),
+				},
+				oauth.format,
 				signal,
-			});
-			const text = await response.text();
-			if (!response.ok) throw new Error(`Token refresh failed (${response.status}): ${text.slice(0, 500)}`);
-			const body = JSON.parse(text) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown };
-			if (typeof body.access_token !== "string") throw new Error("Token refresh returned no access_token");
-			const expiresIn = typeof body.expires_in === "number" ? body.expires_in : 3600;
-			return {
-				...credential,
-				type: "oauth",
-				access: body.access_token,
-				// Servers that don't rotate refresh tokens leave it out: keep the one there is.
-				refresh: typeof body.refresh_token === "string" ? body.refresh_token : credential.refresh,
-				// A minute early, so a request never goes out with a token about to lapse.
-				expires: Date.now() + Math.max(expiresIn - 60, 0) * 1000,
-			} satisfies OAuthCredential;
+			);
+			if (!response.ok) throw oauthFailure("Token refresh", response);
+			return oauthCredential(response.body, credential);
 		},
 		toAuth: async (credential) => ({ apiKey: credential.access }),
 	};
@@ -353,7 +522,7 @@ register({
 					apiKey: keyless
 						? { name: spec.name ?? spec.id, resolve: async () => ({ auth: { apiKey: "unused" } }) }
 						: envApiKeyAuth(spec.name ?? spec.id, []),
-					...(spec.tokenRefresh ? { oauth: tokenRefreshAuth(spec.name ?? spec.id, spec.tokenRefresh as TokenRefresh) } : {}),
+					...(spec.oauth ? { oauth: customOAuthAuth(spec.name ?? spec.id, spec.oauth as CustomOAuth) } : {}),
 				},
 				models: models as never,
 				api: api as never,
