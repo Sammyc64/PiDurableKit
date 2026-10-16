@@ -34,7 +34,11 @@ export type ContextRange = {
     readonly settled: readonly Message[];
     /** Contributed messages from the last assistant message on, before tool result ordering. */
     readonly open: readonly Message[];
+    /** The baseline's system message; see `findBaseline()`. */
+    readonly baseline: Baseline;
 };
+/** A baseline's system message, `null` when the range cannot have one, or `undefined` while a later entry may be one. */
+type Baseline = Message | null | undefined;
 /**
  * `readContext()` that reuses `previous`, an earlier range of the same conversation: with the same head marker, only
  * entries after its tail are scanned. Returns the view and the range to pass to the next read. A range outlives the
@@ -60,3 +64,4 @@ export declare function activeEntries(storage: Storage, conversationId: Conversa
  * the next assistant; a missing result is synthesized and unmatched results are dropped.
  */
 export declare function orderToolResults(messages: readonly Message[]): Message[];
+export {};

@@ -2,9 +2,17 @@ import type { Context, JsonValue } from "@earendil-works/chord";
 import type { ConversationId, ConversationQuery, ConversationRecord, Cursor, DocumentAddress, DocumentId, DocumentPoint, DocumentQuery, DocumentRecord, EntryId, EntryQuery, EntryRecord, Id, Page, Seq, Storage, StorageWrite, StoredDocument, SubmissionId, SubmissionQuery, SubmissionRecord, TaskId, TaskQuery, TaskRecord } from "../../types.ts";
 import type { SqliteDatabase } from "./database.ts";
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
+export type SqliteStorageOptions = {
+    /**
+     * Prefix for every table and index in the durable schema. It must be a SQLite identifier and must not use
+     * SQLite's reserved `sqlite_` prefix. Existing data is not migrated when this changes.
+     */
+    readonly prefix?: string;
+};
 /** Portable SQLite implementation of the Pico storage contract. */
 export declare class SqliteStorage implements Storage {
     private readonly db;
+    private readonly schema;
     private nextId;
     private closed;
     private closing;
@@ -12,7 +20,7 @@ export declare class SqliteStorage implements Storage {
     private readsDrained;
     private constructor();
     /** Initialize storage over an owned SQLite database facade. */
-    static open(db: SqliteDatabase): Promise<SqliteStorage>;
+    static open(db: SqliteDatabase, options?: SqliteStorageOptions): Promise<SqliteStorage>;
     commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq>;
     mintId<I extends Id<string>>(): Promise<I>;
     conversation(id: ConversationId, _context: Context): Promise<ConversationRecord | undefined>;

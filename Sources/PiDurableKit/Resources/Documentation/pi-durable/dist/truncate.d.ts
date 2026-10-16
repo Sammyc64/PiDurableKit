@@ -1,3 +1,4 @@
+import { utf8ByteLength } from "@earendil-works/chord/output";
 /**
  * Shared truncation utilities for tool outputs.
  *
@@ -5,7 +6,7 @@
  * - Line limit (default: 2000 lines)
  * - Byte limit (default: 50KB)
  *
- * Never returns partial lines. Tool output streams are bounded by `src/harness/output.ts` instead.
+ * Never returns partial lines. Tool output streams are bounded by `OutputBuffer` from `@earendil-works/chord/output` instead.
  */
 export declare const DEFAULT_MAX_LINES = 2000;
 export declare const DEFAULT_MAX_BYTES: number;
@@ -39,7 +40,7 @@ export interface TruncationOptions {
     /** Maximum number of bytes (default: 50KB) */
     maxBytes?: number;
 }
-export declare function utf8ByteLength(content: string): number;
+export { utf8ByteLength };
 /**
  * Format bytes as human-readable size.
  */
