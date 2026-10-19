@@ -76,16 +76,6 @@ public struct Storage: Sendable {
         }
     }
 
-    /// The lock a harness holds on this storage, if it is a file or directory of its own. Storages under different
-    /// table prefixes share a SQLite file safely, so each prefix has its own lock.
-    func lock() throws -> StorageLock? {
-        switch kind {
-        case .sqlite(let url, let tablePrefix): try StorageLock(storagePath: url.path(percentEncoded: false), tablePrefix: tablePrefix)
-        case .jsonl(let url, _): try StorageLock(storagePath: url.path(percentEncoded: false))
-        case .memory, .database, .jsonlEnvironment, .custom: nil
-        }
-    }
-
     var specification: BridgeArguments {
         get throws {
             switch kind {
@@ -202,20 +192,17 @@ public struct EnvironmentTarget: Sendable {
 public final class Harness: Sendable {
     public let models: Models
     let id: Int
-    private let storageLock: StorageLock?
     var engine: Engine { models.runtime.engine }
 
-    private init(models: Models, id: Int, storageLock: StorageLock?) {
+    private init(models: Models, id: Int) {
         self.models = models
         self.id = id
-        self.storageLock = storageLock
     }
 
     /// Opens a harness over `storage`.
     ///
     /// - Parameters:
-    ///   - storage: Where to keep conversations. Only one harness may use a storage at a time: opening a SQLite or
-    ///     JSONL storage that another harness has open, in this process or another, throws.
+    ///   - storage: Where to keep conversations. Only one harness may use a storage at a time.
     ///   - models: Model access.
     ///   - extensions: Extensions to install, in order. Change them later with ``install(_:)``.
     ///   - settings: Run policy shared by every conversation.
@@ -240,8 +227,7 @@ public final class Harness: Sendable {
         try await models.prepare()
         let engine = models.runtime.engine
         let id = await engine.makeObjectID()
-        let lock = try storage.lock()
-        let harness = Harness(models: models, id: id, storageLock: lock)
+        let harness = Harness(models: models, id: id)
         engine.host.registerHarness(
             id, extensions: extensions,
             callbacks: HarnessCallbacks(
@@ -265,7 +251,6 @@ public final class Harness: Sendable {
                 ])
         } catch {
             engine.host.removeHarness(id)
-            lock?.release()
             throw error
         }
         return harness
@@ -577,7 +562,5 @@ public final class Harness: Sendable {
     public func close() async throws {
         try await perform("harness.close")
         engine.host.removeHarness(id)
-        // Only a successful close proves the storage is shut. After a failed one the lock stays until deinit.
-        storageLock?.release()
     }
 }
