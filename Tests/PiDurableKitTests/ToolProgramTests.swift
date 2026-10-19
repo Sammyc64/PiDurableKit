@@ -183,18 +183,20 @@ private struct Forecast: Codable, Sendable, Equatable {
 /// Code mode's VMs run in workers, each on a thread of its own.
 @Suite struct CodemodeWorkerTests {
     @Test func aComputingScriptLeavesTheRuntimeFree() async throws {
-        let setup = try await FauxSetup.make(extensions: [.codemode(CodemodeOptions(models: false))])
+        // A runtime of its own: the shared one is busy with the tests running alongside.
+        let runtime = Runtime()
+        let setup = try await FauxSetup.make(extensions: [.codemode(CodemodeOptions(models: false))], runtime: runtime)
         try await setup.faux.append(.toolCall("codemode", ["code": .string("let s = 0; for (let i = 0; i < 3e6; i++) s += i % 7; return s")]))
         try await setup.faux.append(.text("done"))
         let root = try await setup.root()
         let started = ContinuousClock.now
         let submission = try await root.submit("Compute")
         try await Task.sleep(for: .milliseconds(300))
-        // The runtime answers while the script computes.
-        let answered = try await ContinuousClock().measure { _ = try await Runtime.shared.bundledVersions() }
-        #expect(answered < .milliseconds(200), "The runtime waited \(answered) for the script")
+        // The runtime answers while the script computes, rather than once it has finished.
+        let answered = try await ContinuousClock().measure { _ = try await runtime.bundledVersions() }
         _ = try await withTimeout(60) { try await submission.wait() }
-        #expect(ContinuousClock.now - started > answered + .milliseconds(300))
+        let computed = ContinuousClock.now - started
+        #expect(answered < computed / 4, "The runtime waited \(answered) for a script that took \(computed)")
         let result = try #require(try await root.view().entries.compactMap(\.toolResult).first)
         #expect(result.isError == false, "\(result.text)")
         #expect(result.text.contains("8999994"))
@@ -257,7 +259,8 @@ private struct Forecast: Codable, Sendable, Equatable {
         try await faux.append(.text("done"))
         let root = try await harness.root(agent: AgentChange(model: faux.model))
         _ = try await root.submit("Script")
-        try await Task.sleep(for: .milliseconds(500))
+        // Closed while `slow` runs.
+        try await eventually(30) { runs.withLock { $0.contains("slow") } }
         try await harness.close()
 
         harness = try await Harness.open(.sqlite(at: url), models: models, extensions: extensions)

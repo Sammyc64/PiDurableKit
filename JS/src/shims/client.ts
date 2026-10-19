@@ -2,6 +2,10 @@
 //
 // Replaces pi-ai's `utils/pi-user-agent.js` (same export, so its provider APIs send the app's `User-Agent`), and
 // build.mjs patches pi-ai's other "pi"s (the sign-in name, OpenAI Codex's originator, xAI's referrer) to `clientName()`.
+// Strict explicitly: esbuild reaches this module both as a replacement and from patched pi-ai modules, and whether it
+// marked it strict depended on which got there first, so the committed bundle didn't match CI's.
+"use strict";
+
 import { native } from "../runtime/native.ts";
 
 interface Client {

@@ -113,7 +113,7 @@ public struct Extension: Sendable, Identifiable {
 
     /// pi-durable's `read`, `write`, and `edit` tools, working in the harness's ``ExecutionEnvironment``, and with
     /// `shell` its `bash` tool too, like pi-durable's `createCodingTools()`. Commands need an environment with a shell,
-    /// such as ``ExecutionEnvironment/local`` on macOS; there is none on iOS.
+    /// such as `ExecutionEnvironment.local` on macOS; there is none on iOS.
     ///
     /// - Parameters:
     ///   - name: The extension's name.
