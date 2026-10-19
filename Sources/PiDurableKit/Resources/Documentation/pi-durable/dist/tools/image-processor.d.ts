@@ -40,7 +40,10 @@ export type ImageProcessor = {
 };
 /** Formats every provider takes inline; others, such as BMP, need converting. */
 export declare const INLINE_IMAGE_TYPES: ReadonlySet<string>;
-/** Standard base64 of `bytes`, without platform APIs such as `Buffer` or `btoa`. */
+/**
+ * Standard base64 of `bytes`. `btoa` takes a binary string, built 8 KiB at a time: a single `String.fromCharCode`
+ * call with megabytes of arguments overflows the stack.
+ */
 export declare function toBase64(bytes: Uint8Array): string;
 /** The length of the base64 of `byteLength` bytes. */
 export declare function base64Length(byteLength: number): number;

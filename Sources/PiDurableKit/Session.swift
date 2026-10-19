@@ -11,7 +11,7 @@ import Foundation
 /// stored deltas to its base with ``Runtime/applyOperations(_:to:)``. Validate an implementation with
 /// ``Runtime/runStorageConformance(only:_:)``.
 ///
-/// Most apps want ``Storage/sqlite(database:)`` or ``Storage/jsonl(in:directory:fsync:)`` instead, which keep this
+/// Most apps want ``Storage/sqlite(database:tablePrefix:)`` or ``Storage/jsonl(in:directory:fsync:)`` instead, which keep this
 /// format for you.
 public protocol CustomStorage: Sendable {
     /// Atomically persists one batch of `StorageWrite`s and returns its commit sequence number.

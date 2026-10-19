@@ -91,7 +91,7 @@ class HostStorage implements Storage {
 export async function openStorage(spec: Args, context: Context): Promise<Storage> {
 	switch (spec.kind) {
 		case "sqlite":
-			return openNodeSqliteStorage(spec.path);
+			return openNodeSqliteStorage(spec.path, spec.prefix == null ? {} : { prefix: spec.prefix });
 		case "jsonl":
 			return JsonlStorage.open(
 				spec.directory ?? "/",
@@ -100,7 +100,7 @@ export async function openStorage(spec: Args, context: Context): Promise<Storage
 				{ fsync: spec.fsync === true },
 			);
 		case "database":
-			return SqliteStorage.open(new HostSqliteDatabase(spec.database));
+			return SqliteStorage.open(new HostSqliteDatabase(spec.database), spec.prefix == null ? {} : { prefix: spec.prefix });
 		case "custom":
 			return new HostStorage(spec.storage) as unknown as Storage;
 		default:

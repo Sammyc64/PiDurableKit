@@ -26,7 +26,7 @@ public protocol SQLiteExecutor: Sendable {
 
 /// A SQLite database you implement, for pi-durable's portable SQLite storage (pi-durable `SqliteDatabase`): for
 /// example one shared with the rest of your app, encrypted, or in an app group. Open it with
-/// ``Storage/sqlite(database:)``.
+/// ``Storage/sqlite(database:tablePrefix:)``.
 ///
 /// The contract is pi-durable's: `transaction` passes `body` a handle that all of the transaction's work uses, and
 /// must queue every other operation and transaction until it finishes. When `body` throws, roll back and rethrow its

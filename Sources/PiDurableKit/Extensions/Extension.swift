@@ -82,7 +82,8 @@ public struct Extension: Sendable, Identifiable {
     /// `source` is a CommonJS module whose `module.exports` is a pi-durable extension. It can `require`
     /// `@earendil-works/pi-durable`, `@earendil-works/pi-durable/tools`, `@earendil-works/pi-durable/env`,
     /// `@earendil-works/pi-durable/tool-search`, `@earendil-works/pi-durable/codemode`,
-    /// `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`, and `@earendil-works/chord/context`:
+    /// `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`, `@earendil-works/chord/context`, and
+    /// `@earendil-works/chord/output`:
     ///
     /// ```js
     /// const { defineExtension, defineTool } = require("@earendil-works/pi-durable");

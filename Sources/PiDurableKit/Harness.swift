@@ -4,10 +4,10 @@ import Foundation
 public struct Storage: Sendable {
     enum Kind {
         case memory
-        case sqlite(URL)
+        case sqlite(URL, tablePrefix: String?)
         case jsonl(URL, fsync: Bool)
         case jsonlEnvironment(any CustomExecutionEnvironment, directory: String, fsync: Bool)
-        case database(any SQLiteDatabase)
+        case database(any SQLiteDatabase, tablePrefix: String?)
         case custom(any CustomStorage)
     }
 
@@ -18,8 +18,14 @@ public struct Storage: Sendable {
 
     /// One SQLite database file (WAL mode). Conversations survive restarts and crashes; reopen the same file and
     /// call ``Harness/resume()`` (the default) to continue unfinished runs.
-    public static func sqlite(at url: URL) -> Storage {
-        Storage(kind: .sqlite(url))
+    ///
+    /// - Parameters:
+    ///   - url: The database file.
+    ///   - tablePrefix: Prefixes every table and index pi-durable creates, so the database can also hold your own
+    ///     tables, or several storages. A SQLite identifier, not starting with `sqlite_`. Changing it doesn't move
+    ///     existing data.
+    public static func sqlite(at url: URL, tablePrefix: String? = nil) -> Storage {
+        Storage(kind: .sqlite(url, tablePrefix: tablePrefix))
     }
 
     /// Append-only JSONL files in one directory (pi-durable `JsonlStorage`).
@@ -32,8 +38,14 @@ public struct Storage: Sendable {
     }
 
     /// pi-durable's portable SQLite storage over a database you implement.
-    public static func sqlite(database: some SQLiteDatabase) -> Storage {
-        Storage(kind: .database(database))
+    ///
+    /// - Parameters:
+    ///   - database: The database.
+    ///   - tablePrefix: Prefixes every table and index pi-durable creates, so the database can also hold your own
+    ///     tables, or several storages. A SQLite identifier, not starting with `sqlite_`. Changing it doesn't move
+    ///     existing data.
+    public static func sqlite(database: some SQLiteDatabase, tablePrefix: String? = nil) -> Storage {
+        Storage(kind: .database(database, tablePrefix: tablePrefix))
     }
 
     /// pi-durable's portable JSONL storage over a file system you implement, such as a synced or encrypted one.
@@ -53,7 +65,8 @@ public struct Storage: Sendable {
 
     func specification(_ router: HostRouter) throws -> BridgeArguments {
         switch kind {
-        case .database(let database): return ["kind": "database", "database": router.register(database)]
+        case .database(let database, let tablePrefix):
+            return ["kind": "database", "database": router.register(database), "prefix": tablePrefix]
         case .custom(let storage): return ["kind": "custom", "storage": router.register(storage)]
         case .jsonlEnvironment(let environment, let directory, let fsync):
             router.register(environment)
@@ -68,7 +81,8 @@ public struct Storage: Sendable {
             switch kind {
             case .memory: return ["kind": "memory"]
             case .database, .custom, .jsonlEnvironment: throw PiDurableError.runtime("This storage needs a runtime")
-            case .sqlite(let url): return ["kind": "sqlite", "path": url.path(percentEncoded: false)]
+            case .sqlite(let url, let tablePrefix):
+                return ["kind": "sqlite", "path": url.path(percentEncoded: false), "prefix": tablePrefix]
             case .jsonl(let url, let fsync):
                 try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
                 return ["kind": "jsonl", "path": try FileOperations.realPath(url.path(percentEncoded: false)), "fsync": fsync]

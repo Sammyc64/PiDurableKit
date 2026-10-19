@@ -94,6 +94,7 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 | `registerStorageConformance`, `registerEnvConformance` | `Runtime.runStorageConformance(_:)`, `Runtime.runEnvironmentConformance(_:)` |
 | Chord `apply(value, ops)` | `Runtime.applyOperations(_:to:)` |
 | `SqliteStorage` over a `SqliteDatabase` facade | `Storage.sqlite(database:)` with your `SQLiteDatabase` |
+| `SqliteStorage.open(db, { prefix })`, `openNodeSqliteStorage(path, { prefix })` | `Storage.sqlite(database:tablePrefix:)`, `.sqlite(at:tablePrefix:)` |
 | pi-ai `models.completeSimple()`, `streamSimple()` | `models.complete(_:context:options:)`, `models.stream(_:context:options:)` |
 | a pi-ai provider over Apple's FoundationModels (Swift-only) | `models.register(FoundationModelsProvider())`, `ModelRef.appleOnDevice`, `.applePrivateCloudCompute` |
 | `ROOT_CONVERSATION_ID`, `INSTRUCTIONS_KEY` | `ConversationID.root`, `PromptSection.instructionsKey` |
@@ -161,7 +162,7 @@ try await harness.install(Extension("dice", javaScript: source))
 ```
 
 The module is CommonJS and can `require` `@earendil-works/pi-durable` (and `/tools`, `/env`, `/tool-search`,
-`/codemode`), `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`, and `@earendil-works/chord/context`. As in pi-durable, extension code is not sandboxed, so install only code you trust;
+`/codemode`), `@earendil-works/pi-codemode/portable`, `@earendil-works/pi-ai`, `@earendil-works/chord/context`, and `@earendil-works/chord/output` (bounded tool output). As in pi-durable, extension code is not sandboxed, so install only code you trust;
 it cannot reach PiDurableKit's own bridge to storage. Like any extension, install it again after a restart before
 resuming (`Harness.open(…, resume: false)`, `install`, `resume()`) so its pending tool calls continue.
 
@@ -457,6 +458,10 @@ let harness = try await Harness.open(.sqlite(database: AppDatabase(…)), models
 
 The contract is pi-durable's: a transaction's work uses the handle passed to its body, and every other operation waits
 until it finishes.
+
+To keep pi-durable's tables apart from your own in a shared database, or to keep several storages in one file, give
+each a table prefix: `.sqlite(database: AppDatabase(…), tablePrefix: "agent_")` (also `.sqlite(at:tablePrefix:)`).
+Changing a prefix doesn't move existing data.
 
 ### Replicating a harness
 

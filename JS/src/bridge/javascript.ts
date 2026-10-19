@@ -2,6 +2,7 @@
 // unchanged, exactly as a Node app would install its own. Like pi-durable, there is no sandbox: install only code you
 // trust.
 import * as chordContext from "@earendil-works/chord/context";
+import * as chordOutput from "@earendil-works/chord/output";
 import * as piAI from "@earendil-works/pi-ai";
 import * as piDurable from "@earendil-works/pi-durable";
 import * as piDurableEnv from "@earendil-works/pi-durable/env";
@@ -21,6 +22,7 @@ const modules: Record<string, unknown> = {
 	"@earendil-works/pi-codemode/portable": piCodemode,
 	"@earendil-works/pi-ai": piAI,
 	"@earendil-works/chord/context": chordContext,
+	"@earendil-works/chord/output": chordOutput,
 };
 
 /**
