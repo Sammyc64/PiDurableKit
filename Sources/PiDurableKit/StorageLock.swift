@@ -4,22 +4,24 @@ import os
 /// An advisory lock on a storage, held while a ``Harness`` has it open.
 ///
 /// pi-durable has no locking of its own: two harnesses on one storage would both resume its unfinished runs and run
-/// the same tool calls twice. The lock lives in a sibling file, `<storage path>.lock`, and `flock` releases it when
-/// the process dies, so a crash never leaves a stale lock.
+/// the same tool calls twice. The lock lives in a sibling file, `<storage path>.lock` (`<storage path>.<prefix>.lock`
+/// for a SQLite table prefix), and `flock` releases it when the process dies, so a crash never leaves a stale lock.
 final class StorageLock: Sendable {
     /// The open lock file, or `nil` once released.
     private let descriptor: OSAllocatedUnfairLock<Int32?>
 
-    /// Locks the storage at `path`, or throws when another harness (in this process or another) holds it.
-    init(storagePath path: String) throws {
-        let lockPath = path + ".lock"
+    /// Locks the storage at `path` (its tables under `tablePrefix`), or throws when another harness (in this process or
+    /// another) holds it.
+    init(storagePath path: String, tablePrefix: String? = nil) throws {
+        let lockPath = path + (tablePrefix.map { ".\($0)" } ?? "") + ".lock"
         let descriptor = Darwin.open(lockPath, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
         guard descriptor >= 0 else { throw FileOperationError.posix(lockPath) }
         guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
             let busy = errno == EWOULDBLOCK
             Darwin.close(descriptor)
             if busy {
-                throw PiDurableError.runtime("The storage at \(path) is already open in another harness. Close it first.")
+                let tables = tablePrefix.map { " (tables prefixed \($0))" } ?? ""
+                throw PiDurableError.runtime("The storage at \(path)\(tables) is already open in another harness. Close it first.")
             }
             throw FileOperationError.posix(lockPath)
         }

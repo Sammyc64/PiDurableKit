@@ -41,6 +41,16 @@ import Testing
         try await reopened.close()
     }
 
+    @Test func eachTablePrefixHasItsOwnLock() async throws {
+        let url = temporaryDirectory().appending(path: "shared.sqlite")
+        let models = Models(builtinProviders: false)
+        let first = try await Harness.open(.sqlite(at: url, tablePrefix: "first_"), models: models)
+        let second = try await Harness.open(.sqlite(at: url, tablePrefix: "second_"), models: models)
+        await #expect(throws: PiDurableError.self) { try await Harness.open(.sqlite(at: url, tablePrefix: "first_"), models: models) }
+        try await first.close()
+        try await second.close()
+    }
+
     @Test func malformedToolArgumentsCarryTheirError() throws {
         let json = #"{"type":"toolCall","id":"call","name":"roll","arguments":{},"argumentsError":"Not a JSON object: {sides"}"#
         let call = try JSONDecoder().decode(ToolCall.self, from: Data(json.utf8))

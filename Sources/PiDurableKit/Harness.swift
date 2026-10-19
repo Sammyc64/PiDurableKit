@@ -76,11 +76,13 @@ public struct Storage: Sendable {
         }
     }
 
-    /// The file system path two harnesses must not share, if the storage has one.
-    var lockPath: String? {
+    /// The lock a harness holds on this storage, if it is a file or directory of its own. Storages under different
+    /// table prefixes share a SQLite file safely, so each prefix has its own lock.
+    func lock() throws -> StorageLock? {
         switch kind {
-        case .sqlite(let url), .jsonl(let url, _): url.path(percentEncoded: false)
-        case .memory, .database: nil
+        case .sqlite(let url, let tablePrefix): try StorageLock(storagePath: url.path(percentEncoded: false), tablePrefix: tablePrefix)
+        case .jsonl(let url, _): try StorageLock(storagePath: url.path(percentEncoded: false))
+        case .memory, .database, .jsonlEnvironment, .custom: nil
         }
     }
 
@@ -238,7 +240,7 @@ public final class Harness: Sendable {
         try await models.prepare()
         let engine = models.runtime.engine
         let id = await engine.makeObjectID()
-        let lock = try storage.lockPath.map { try StorageLock(storagePath: $0) }
+        let lock = try storage.lock()
         let harness = Harness(models: models, id: id, storageLock: lock)
         engine.host.registerHarness(
             id, extensions: extensions,
