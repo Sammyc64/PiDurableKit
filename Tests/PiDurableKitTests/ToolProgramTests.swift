@@ -306,6 +306,8 @@ private func releaseAWorkerDuringItsLastReply() async throws {
     released.signal()
     // Runs once the reply's block has ended (or trapped).
     await withCheckedContinuation { continuation in queue.async { continuation.resume() } }
+    // The exchange's task, which queued the block, lets the worker go only when it returns, which can be later.
+    try await eventually { observed == nil }
     try #require(observed == nil, "The worker is released once the reply's block has ended")
 }
 
