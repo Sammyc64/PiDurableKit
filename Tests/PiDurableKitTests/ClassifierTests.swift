@@ -151,6 +151,29 @@ extension MockServerTests {
         }
     }
 
+    /// A custom provider following a built-in catalog classifies with the catalog's System One classifiers, pointed at
+    /// it, and lists none it has no classifier API for (OpenAI's use its Decisions API).
+    @Test func aProviderFollowingACatalogClassifies() async throws {
+        Self.serveSystemOne(host: "gateway.clef.test")
+        let models = Models(catalog: nil, runtime: Self.runtime)
+        try await models.register(CustomProvider(
+            id: "gateway", baseURL: URL(string: "https://gateway.clef.test/v1")!, catalog: .openRouter))
+        let classifiers = try await models.models(for: "gateway", type: .classifier)
+        let classifier = try #require(classifiers.first)
+        #expect(classifiers.allSatisfy { $0.api == "typesafe-system-one" && $0.baseUrl == "https://gateway.clef.test/v1" })
+
+        let result = try await models.classify(classifier.ref, context: Self.context)
+        #expect(result.answers["spam"] == .bool(probability: 0.9))
+        let request = try #require(MockServer.requests(to: "gateway.clef.test").last)
+        #expect(request.url.path() == "/v1/systemone")
+        #expect(request.json?["model"] == .string(classifier.modelId))
+
+        try await models.register(CustomProvider(
+            id: "decisions-gateway", baseURL: URL(string: "https://decisions.gateway.clef.test/v1")!, catalog: .openAI))
+        #expect(try await models.models(for: "decisions-gateway").isEmpty == false)
+        #expect(try await models.models(for: "decisions-gateway", type: .classifier).isEmpty)
+    }
+
     /// Code mode's `models.classify()` resolves the model by provider and ID, and classifies with the harness's models.
     @Test func codeModeScriptsClassify() async throws {
         Self.serveSystemOne(host: "codemode.clef.test")

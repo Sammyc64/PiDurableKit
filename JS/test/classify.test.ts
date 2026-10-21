@@ -160,3 +160,35 @@ test("models.classify only takes classifier models", async () => {
 		(error: Error) => error.name === "NotFound" && /clef\/chat-1/.test(error.message),
 	);
 });
+
+/** Models with the built-in providers, and a keyless gateway at the stub serving `catalog`'s models. */
+async function followCatalog(catalog: string) {
+	const id = nextModels++;
+	await call("models.create", { id, builtin: true });
+	await call("models.addProvider", { id, provider: { id: "gateway", baseUrl, api: "openai-completions", catalog, models: [] } });
+	return id;
+}
+
+test("a provider following a built-in catalog classifies with the catalog's System One classifiers", async () => {
+	const id = await followCatalog("openrouter");
+	const classifiers = (await call("models.list", { id, provider: "gateway", type: "classifier" })) as Json[];
+	assert.ok(classifiers.length > 0);
+	assert.ok(classifiers.every((model) => model.api === "typesafe-system-one" && model.provider === "gateway" && model.baseUrl === baseUrl));
+	const result = (await call("models.classify", {
+		id,
+		model: { provider: "gateway", modelId: classifiers[0]!.id },
+		context: { state: {}, questions },
+	})) as Json;
+	assert.equal(result.stopReason, "stop", String(result.errorMessage));
+	assert.deepEqual(
+		received.map((request) => [request.url, request.body.model]),
+		[["/v1/systemone", classifiers[0]!.id]],
+	);
+});
+
+test("a followed catalog leaves out the classifiers it has no classifier API for", async () => {
+	// OpenAI's classifiers use its Decisions API.
+	const id = await followCatalog("openai");
+	assert.ok(((await call("models.list", { id, provider: "gateway" })) as Json[]).length > 0);
+	assert.deepEqual(await call("models.list", { id, provider: "gateway", type: "classifier" }), []);
+});
