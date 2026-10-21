@@ -329,21 +329,12 @@ extension MockServerTests {
     /// Data that arrives after the engine is gone cancels its request. The response was already allowed, and a body
     /// that keeps streaming never goes idle long enough to time out, so it would keep downloading with nothing reading
     /// it. No public signal says when the session has allowed a response, so the test hands the delegate the chunk
-    /// itself, on the engine's queue as the session does, for a request the server holds open.
-    @Test func dataAfterTheEngineIsGone() throws {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [OpenRequest.self]
-        var engine: Engine? = Engine(configuration: .init(urlSessionConfiguration: configuration))
-        weak let observed = engine
-        let network = Network(engine: try #require(engine), configuration: configuration)
-        let queue = try #require(engine).queue
-        queue.sync { network.start(id: 1, url: "https://open.test/", method: "GET", headersJSON: "[]", body: nil) }
-        try #require(OpenRequest.started.wait(timeout: .now() + 10) == .success, "The request reaches the server")
-        let task = try #require(OpenRequest.task.withLock { $0 }, "The server sees the request's task")
-        engine = nil
-        try #require(observed == nil, "The engine is gone")
-        queue.sync { network.urlSession(.shared, dataTask: task, didReceive: Data(String.sse("{}").utf8)) }
-        #expect(OpenRequest.stopped.wait(timeout: .now() + 10) == .success, "The request is cancelled")
+    /// itself, on the engine's queue as the session does, for a request the server holds open. In a process of its own,
+    /// as delivering it traps.
+    @Test func dataAfterTheEngineIsGone() async {
+        await #expect(processExitsWith: .success) {
+            try cancelDataAfterTheEngineIsGone()
+        }
     }
 }
 
@@ -362,6 +353,23 @@ private func receiveAResponseAfterTheEngineIsGone() throws {
     HeldResponse.release.signal()
     // The body never ends, so only the delegate turning the response away (cancelling) stops the loading.
     try #require(HeldResponse.stopped.wait(timeout: .now() + 10) == .success, "The response is turned away")
+}
+
+/// Starts a request that `OpenRequest` holds open, frees the engine, then hands the delegate a chunk for the request.
+private func cancelDataAfterTheEngineIsGone() throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [OpenRequest.self]
+    var engine: Engine? = Engine(configuration: .init(urlSessionConfiguration: configuration))
+    weak let observed = engine
+    let network = Network(engine: try #require(engine), configuration: configuration)
+    let queue = try #require(engine).queue
+    queue.sync { network.start(id: 1, url: "https://open.test/", method: "GET", headersJSON: "[]", body: nil) }
+    try #require(OpenRequest.started.wait(timeout: .now() + 10) == .success, "The request reaches the server")
+    let task = try #require(OpenRequest.task.withLock { $0 }, "The server sees the request's task")
+    engine = nil
+    try #require(observed == nil, "The engine is gone")
+    queue.sync { network.urlSession(.shared, dataTask: task, didReceive: Data(String.sse("{}").utf8)) }
+    try #require(OpenRequest.stopped.wait(timeout: .now() + 10) == .success, "The request is cancelled")
 }
 
 /// Serves one response, held until released, with a body that never ends; says when the client stops loading.
