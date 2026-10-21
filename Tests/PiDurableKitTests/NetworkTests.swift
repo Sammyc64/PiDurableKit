@@ -316,6 +316,8 @@ extension MockServerTests {
 }
 }
 
+// Exit tests run only where Swift Testing has them (not the iOS simulator).
+#if os(macOS)
 /// `URLSession` keeps its delegate until it is invalidated, so `Network` can outlive its engine.
 @Suite struct NetworkLifetimeTests {
     /// A response that arrives after the engine is gone is turned away, not delivered to the freed engine. In a process
@@ -337,6 +339,7 @@ extension MockServerTests {
         }
     }
 }
+#endif
 
 /// Starts a request whose response `HeldResponse` holds, frees the engine, then lets the response arrive.
 private func receiveAResponseAfterTheEngineIsGone() throws {

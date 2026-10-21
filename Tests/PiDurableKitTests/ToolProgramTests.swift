@@ -274,6 +274,8 @@ private struct Forecast: Codable, Sendable, Equatable {
         try await harness.close()
     }
 
+    // Exit tests run only where Swift Testing has them (not the iOS simulator).
+    #if os(macOS)
     /// A script's last reply makes it call `done`, which lets `CodemodeWorkers.execute` release the worker (two are
     /// already kept idle) while the block that delivered the reply is still running: the block must not then read the
     /// released worker. In a process of its own, as reading it traps.
@@ -291,6 +293,7 @@ private struct Forecast: Codable, Sendable, Equatable {
             try await answerAFlushAfterItsWorkerIsReleased()
         }
     }
+    #endif
 }
 
 /// Serves one script on a worker the test owns, and releases the worker while the block that delivered the script's
