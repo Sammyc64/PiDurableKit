@@ -314,3 +314,54 @@ extension MockServerTests {
     }
 }
 }
+
+/// `URLSession` keeps its delegate until it is invalidated, so `Network` can outlive its engine.
+@Suite struct NetworkLifetimeTests {
+    /// A response that arrives after the engine is gone is turned away, not delivered to the freed engine. In a process
+    /// of its own, as delivering it traps.
+    @Test func aResponseAfterTheEngineIsGone() async {
+        await #expect(processExitsWith: .success) {
+            try receiveAResponseAfterTheEngineIsGone()
+        }
+    }
+}
+
+/// Starts a request whose response `HeldResponse` holds, frees the engine, then lets the response arrive.
+private func receiveAResponseAfterTheEngineIsGone() throws {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [HeldResponse.self]
+    var engine: Engine? = Engine(configuration: .init(urlSessionConfiguration: configuration))
+    weak let observed = engine
+    let network = Network(engine: try #require(engine), configuration: configuration)
+    let queue = try #require(engine).queue
+    queue.sync { network.start(id: 1, url: "https://held.test/", method: "GET", headersJSON: "[]", body: nil) }
+    try #require(HeldResponse.started.wait(timeout: .now() + 10) == .success, "The request reaches the server")
+    engine = nil
+    try #require(observed == nil, "The engine is gone")
+    HeldResponse.release.signal()
+    // The body never ends, so only the delegate turning the response away (cancelling) stops the loading.
+    try #require(HeldResponse.stopped.wait(timeout: .now() + 10) == .success, "The response is turned away")
+}
+
+/// Serves one response, held until released, with a body that never ends; says when the client stops loading.
+private final class HeldResponse: URLProtocol, @unchecked Sendable {
+    static let started = DispatchSemaphore(value: 0)
+    static let release = DispatchSemaphore(value: 0)
+    static let stopped = DispatchSemaphore(value: 0)
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.started.signal()
+        _ = Self.release.wait(timeout: .now() + 10)
+        let headers = ["content-type": "text/event-stream"]
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(String.sse("{}").utf8))
+    }
+
+    override func stopLoading() {
+        Self.stopped.signal()
+    }
+}
