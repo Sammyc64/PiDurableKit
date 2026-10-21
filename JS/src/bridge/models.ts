@@ -545,6 +545,9 @@ register({
 			if (implementation === undefined) throw new Error(`Unsupported API "${model.api}"`);
 			api[model.api] ??= implementation();
 		}
+		// A followed catalog's classifiers, now and after a refresh, can use any API in `classifierApis`; it leaves out
+		// those using another (`followingCatalog` below), which this provider couldn't classify with.
+		if (source) for (const [name, implementation] of Object.entries(classifierApis)) classifiers[name] ??= implementation();
 		// Keyless servers (Ollama, LM Studio, a local classifier) still get a placeholder key: the SDKs, and pi-ai's
 		// classifier requests, refuse to send without one.
 		const keyless = spec.apiKey === undefined || spec.apiKey === null;
@@ -567,7 +570,8 @@ register({
 		) as unknown as Provider;
 		if (source) {
 			const headers = spec.headers as Record<string, string> | undefined;
-			provider = followingCatalog(provider, source as unknown as Provider, (model) =>
+			const serves = (model: AnyModel) => getModelType(model) !== "classifier" || classifiers[model.api] !== undefined;
+			provider = followingCatalog(provider, source as unknown as Provider, serves, (model) =>
 				({
 					...model,
 					provider: spec.id,

@@ -539,7 +539,8 @@ credential.
 
 A custom provider's models of type `.classifier` answer questions about a state through pi-ai's classifier API,
 TypeSafe's System One (`.typesafeSystemOne`). Without an `apiKey`, as for a keyless local service, requests send a
-placeholder key, as chat requests do.
+placeholder key, as chat requests do. A provider following a `catalog` serves its System One classifiers too, pointed
+at the provider; it leaves out those using another classifier API (such as OpenAI's Decisions API).
 
 ```swift
 try await models.register(CustomProvider(
