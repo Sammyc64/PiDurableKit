@@ -6,7 +6,7 @@ import Foundation
 final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     /// Weak: the session keeps its delegate until it is invalidated, so this can outlive the engine. Events for an engine
     /// that is gone are dropped, and a response or data for one cancels its request.
-    private weak var engine: Engine?
+    private weak let engine: Engine?
     private var session: URLSession!
     private var tasks: [Int: URLSessionDataTask] = [:]
     private var ids: [Int: Int] = [:] // task identifier → fetch id
