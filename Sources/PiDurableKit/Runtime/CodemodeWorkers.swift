@@ -145,10 +145,16 @@ final class CodemodeWorker: @unchecked Sendable {
 
         // One exchange: the runtime answers on its own thread, and the reply comes back to this queue. A runtime that
         // can't be reached stops the execution.
+        //
+        // The reply's block holds the worker until it ends: the last reply makes the script call `done`, and
+        // `CodemodeWorkers.execute` may then let the worker go before the block returns. While the runtime answers,
+        // the worker is held only by its execution, so a reply to a worker already let go is dropped (one kept for a
+        // later execution ignores it: exchange ids never repeat in a worker).
         define("exchange", { [unowned self] (id: Int, messages: String) in
             guard let exchange = self.exchange else { return }
-            Task {
+            Task { [weak self] in
                 let reply = (try? await exchange(messages)) ?? #"{"type":"stop"}"#
+                guard let self else { return }
                 self.queue.async {
                     self.worker.invokeMethod("reply", withArguments: [id, reply])
                     CodemodeWorker.afterReply.withLock { $0 }?()
