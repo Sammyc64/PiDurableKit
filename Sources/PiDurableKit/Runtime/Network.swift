@@ -5,7 +5,7 @@ import Foundation
 /// Delegate callbacks run on the engine's queue, so every delivery is ordered and isolated to the engine.
 final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     /// Weak: the session keeps its delegate until it is invalidated, so this can outlive the engine. Events for an engine
-    /// that is gone are dropped.
+    /// that is gone are dropped, and a response or data for one cancels its request.
     private weak var engine: Engine?
     private var session: URLSession!
     private var tasks: [Int: URLSessionDataTask] = [:]
@@ -80,7 +80,13 @@ final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard let id = ids[dataTask.taskIdentifier], let engine else { return }
+        guard let id = ids[dataTask.taskIdentifier] else { return }
+        guard let engine else {
+            // Its response was allowed, and a body that keeps streaming never times out: stop it rather than download
+            // it for no one. Completion then clears its bookkeeping.
+            dataTask.cancel()
+            return
+        }
         engine.assumeIsolated { $0.deliverData(id: id, data: data) }
     }
 
