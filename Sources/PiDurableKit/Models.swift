@@ -239,10 +239,12 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
     /// Where requests go, such as `https://api.anthropic.com` (a placeholder for providers whose address depends on
     /// the account, such as `https://{location}-aiplatform.googleapis.com`).
     public let baseUrl: String?
+    /// Whether the model reasons; always `false` for a classifier.
     public let reasoning: Bool
     /// Accepted inputs: `text`, `image`.
     public let input: [String]
     public let contextWindow: Int
+    /// The most output tokens a chat model's response can have; `0` for a classifier, which doesn't set one.
     public let maxTokens: Int
     /// Cost per million tokens.
     public let cost: Usage.Cost

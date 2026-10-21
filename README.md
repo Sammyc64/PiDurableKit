@@ -559,8 +559,9 @@ if case .bool(let probability)? = result.answers["spam"], probability > 0.8 { â€
 ```
 
 A classification answers every question or throws `ClassifierError`: `.failed` with the service's error (and the
-`usage` it reported, if any), or `.aborted` when the task is cancelled. Code mode scripts classify with the harness's
-models too: `models.classify(await models.getModelOfType("classifier", "judge", "judge-1"), { state, questions })`.
+`usage` it reported, if any), or `.aborted` when the task is cancelled. A model that is unknown or not a classifier
+throws `PiDurableError.notFound`. Code mode scripts classify with the harness's models too:
+`models.classify(await models.getModelOfType("classifier", "judge", "judge-1"), { state, questions })`.
 
 ### Apple Foundation Models
 

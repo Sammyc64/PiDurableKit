@@ -91,7 +91,8 @@ public enum ClassifierError: Error, Sendable, Hashable, LocalizedError, CustomSt
 extension Models {
     /// Answers questions about a state with a classifier model (pi-ai `models.classify`), such as a ``CustomProvider``
     /// model of type ``ModelType/classifier``. Credentials and headers resolve as for other requests. A classification
-    /// answers every question, or throws ``ClassifierError``; cancelling the task aborts the request.
+    /// answers every question, or throws ``ClassifierError``; cancelling the task aborts the request. A model that is
+    /// unknown or not a classifier throws ``PiDurableError/notFound(_:)``.
     ///
     /// Tools that classify can report the spend in ``ToolResult/usage``.
     public func classify(_ model: ModelRef, context: ClassifierContext) async throws -> ClassifierResult {
