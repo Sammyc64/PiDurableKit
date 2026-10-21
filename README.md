@@ -96,6 +96,7 @@ The Swift API mirrors pi-durable's, with Swift concurrency in place of Chord con
 | `SqliteStorage` over a `SqliteDatabase` facade | `Storage.sqlite(database:)` with your `SQLiteDatabase` |
 | `SqliteStorage.open(db, { prefix })`, `openNodeSqliteStorage(path, { prefix })` | `Storage.sqlite(database:tablePrefix:)`, `.sqlite(at:tablePrefix:)` |
 | pi-ai `models.completeSimple()`, `streamSimple()` | `models.complete(_:context:options:)`, `models.stream(_:context:options:)` |
+| pi-ai `models.classify()`, `getModelsOfType()` | `models.classify(_:context:)`, `models.models(for:type:)` |
 | a pi-ai provider over Apple's FoundationModels (Swift-only) | `models.register(FoundationModelsProvider())`, `ModelRef.appleOnDevice`, `.applePrivateCloudCompute` |
 | `ROOT_CONVERSATION_ID`, `INSTRUCTIONS_KEY` | `ConversationID.root`, `PromptSection.instructionsKey` |
 | `ReadAfterWrite`, `SessionFailed`, `StorageRequestError`, `ConversationBusy`, `FileError`, `ExecutionError`, `Jsonl*Error` | `PiDurableError.readAfterWrite`, `.sessionFailed(message:cause:)`, `.storageRequestError`, `.conversationBusy(id)`, `.file(code:message:path:)`, `.execution(code:message:spillPath:)`, `.jsonlCorrupted`, `.jsonlPoisoned` |
@@ -533,6 +534,32 @@ credential.
 `ProviderInfo.acceptsAPIKey` says which providers take an API key; some built-in ones only have a sign-in.
 
 > Shipping provider API keys inside an app exposes them to anyone who inspects it. For production, point a `CustomProvider` (or `Settings.Stream.headers`) at your own backend proxy.
+
+### Classification
+
+A custom provider's models of type `.classifier` answer questions about a state through pi-ai's classifier API,
+TypeSafe's System One (`.typesafeSystemOne`). Without an `apiKey`, as for a keyless local service, requests send a
+placeholder key, as chat requests do.
+
+```swift
+try await models.register(CustomProvider(
+    id: "judge", baseURL: URL(string: "https://judge.example.com/v1")!, api: .typesafeSystemOne,
+    models: [.init(id: "judge-1", type: .classifier)]))
+let classifiers = try await models.models(for: "judge", type: .classifier)   // listings are of chat models by default
+
+let result = try await models.classify(ModelRef(provider: "judge", modelId: "judge-1"), context: ClassifierContext(
+    state: ["text": .string(message)],
+    questions: [
+        "spam": .bool(instructions: "Is this spam?", whenTrue: "Unsolicited bulk mail", whenFalse: "Anything else"),
+        "topic": .choice(instructions: "What is it about?", labels: ["billing": "Payments", "support": "Help with the app"]),
+        "urgency": .score(instructions: "How urgent is it?", levels: ["Whenever", "This week", "Today"]),
+    ]))
+if case .bool(let probability)? = result.answers["spam"], probability > 0.8 { … }
+```
+
+A classification answers every question or throws `ClassifierError`: `.failed` with the service's error (and the
+`usage` it reported, if any), or `.aborted` when the task is cancelled. Code mode scripts classify with the harness's
+models too: `models.classify(await models.getModelOfType("classifier", "judge", "judge-1"), { state, questions })`.
 
 ### Apple Foundation Models
 

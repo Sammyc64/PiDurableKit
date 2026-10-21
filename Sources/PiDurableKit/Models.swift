@@ -95,9 +95,9 @@ public final class Models: Sendable {
         try await call("models.providers")
     }
 
-    /// The chat models of one provider, or of every provider.
-    public func models(for provider: ProviderID? = nil) async throws -> [ModelInfo] {
-        try await call("models.list", ["provider": provider])
+    /// The models of one provider, or of every provider: chat models, or those of another `type`, such as classifiers.
+    public func models(for provider: ProviderID? = nil, type: ModelType = .chat) async throws -> [ModelInfo] {
+        try await call("models.list", ["provider": provider, "type": type])
     }
 
     /// Signs in to a provider with OAuth, such as a Claude Pro/Max or ChatGPT subscription, GitHub Copilot, or
@@ -184,7 +184,7 @@ public final class Models: Sendable {
         try await call("models.refresh", ["providers": providers, "allowNetwork": allowNetwork, "force": force])
     }
 
-    /// Registers a custom provider, such as a local Ollama or LM Studio server, or a proxy.
+    /// Registers a custom provider, such as a local Ollama or LM Studio server, a proxy, or a classifier service.
     public func register(_ provider: CustomProvider) async throws {
         try await perform("models.addProvider", ["provider": provider])
     }
@@ -226,13 +226,15 @@ public struct ProviderInfo: Decodable, Sendable, Hashable, Identifiable {
     public let oauth: OAuthInfo?
 }
 
-/// A chat model of a provider's catalog.
+/// A model of a provider's catalog: a chat model, or a classifier.
 public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
     public var id: String { "\(provider)/\(modelId)" }
     public let provider: ProviderID
     public let modelId: String
     public let name: String
-    /// The wire protocol, such as `anthropic-messages` or `openai-responses`.
+    /// What the model is for.
+    public let type: ModelType
+    /// The wire protocol, such as `anthropic-messages`, `openai-responses`, or for a classifier, `typesafe-system-one`.
     public let api: String
     /// Where requests go, such as `https://api.anthropic.com` (a placeholder for providers whose address depends on
     /// the account, such as `https://{location}-aiplatform.googleapis.com`).
@@ -263,7 +265,7 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
     public var ref: ModelRef { ModelRef(provider: provider, modelId: modelId) }
 
     private enum CodingKeys: String, CodingKey {
-        case provider, id, name, api, baseUrl, reasoning, input, contextWindow, maxTokens, cost, thinkingLevels
+        case provider, id, name, type, api, baseUrl, reasoning, input, contextWindow, maxTokens, cost, thinkingLevels
     }
 
     public init(from decoder: Decoder) throws {
@@ -271,6 +273,7 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
         provider = try container.decode(ProviderID.self, forKey: .provider)
         modelId = try container.decode(String.self, forKey: .id)
         name = try container.decodeIfPresent(String.self, forKey: .name) ?? modelId
+        type = try container.decodeIfPresent(ModelType.self, forKey: .type) ?? .chat
         api = try container.decodeIfPresent(String.self, forKey: .api) ?? ""
         baseUrl = try container.decodeIfPresent(String.self, forKey: .baseUrl)
         reasoning = try container.decodeIfPresent(Bool.self, forKey: .reasoning) ?? false
@@ -284,6 +287,14 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
     }
 }
 
+/// What a model is for (pi-ai `ModelType`).
+public enum ModelType: String, Codable, Sendable, Hashable {
+    /// Chat: harnesses, and ``Models/complete(_:context:options:)`` and ``Models/stream(_:context:options:)``.
+    case chat
+    /// Classification, with ``Models/classify(_:context:)``.
+    case classifier
+}
+
 /// A provider of your own (pi-ai `createProvider`), such as Ollama, LM Studio, vLLM, a proxy, or a gateway: the same
 /// shape as a custom provider in pi's `models.json`.
 ///
@@ -294,7 +305,7 @@ public struct ModelInfo: Decodable, Sendable, Hashable, Identifiable {
 ///     models: [.init(id: "llama3.1:8b", contextWindow: 131_072)]))
 /// ```
 public struct CustomProvider: Encodable, Sendable {
-    /// A pi-ai chat API implementation (`model.api`).
+    /// A pi-ai API implementation (`model.api`): a chat API, or for classifier models, a classifier API.
     public struct API: RawRepresentable, Hashable, Encodable, Sendable, ExpressibleByStringLiteral {
         public let rawValue: String
         public init(rawValue: String) { self.rawValue = rawValue }
@@ -313,12 +324,17 @@ public struct CustomProvider: Encodable, Sendable {
         public static let googleVertex: API = "google-vertex"
         public static let mistralConversations: API = "mistral-conversations"
         public static let piMessages: API = "pi-messages"
+        /// TypeSafe's System One, a classifier API.
+        public static let typesafeSystemOne: API = "typesafe-system-one"
     }
 
-    /// A pi-ai chat `Model`. Omitted fields follow the provider (`api`, `baseUrl`, `headers`) or pi-ai's
-    /// custom-provider defaults.
+    /// A pi-ai `Model`: a chat model, or with `type: .classifier`, a classifier. Omitted fields follow the provider
+    /// (`api`, `baseUrl`, `headers`) or pi-ai's custom-provider defaults.
     public struct Model: Encodable, Sendable {
         public var id: String
+        /// What the model is for; chat by default. A classifier uses a classifier API, such as
+        /// ``CustomProvider/API/typesafeSystemOne``.
+        public var type: ModelType?
         public var name: String?
         /// Overrides the provider's API, for mixed-API providers.
         public var api: API?
@@ -341,12 +357,13 @@ public struct CustomProvider: Encodable, Sendable {
         public var other: JSONObject
 
         public init(
-            id: String, name: String? = nil, api: API? = nil, baseURL: URL? = nil, reasoning: Bool? = nil,
+            id: String, type: ModelType? = nil, name: String? = nil, api: API? = nil, baseURL: URL? = nil, reasoning: Bool? = nil,
             input: [String]? = nil, cost: Usage.Cost? = nil, contextWindow: Int? = nil, maxTokens: Int? = nil,
             headers: [String: String]? = nil, compat: JSONObject? = nil, thinkingLevelMap: [ThinkingLevel: String?]? = nil,
             other: JSONObject = [:]
         ) {
             self.id = id
+            self.type = type
             self.name = name
             self.api = api
             self.baseURL = baseURL
@@ -364,6 +381,7 @@ public struct CustomProvider: Encodable, Sendable {
         public func encode(to encoder: Encoder) throws {
             var json = other
             json["id"] = .string(id)
+            if let type { json["type"] = .string(type.rawValue) }
             if let name { json["name"] = .string(name) }
             if let api { json["api"] = .string(api.rawValue) }
             if let baseURL { json["baseUrl"] = .string(baseURL.absoluteString) }

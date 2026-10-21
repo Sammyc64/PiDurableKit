@@ -14,6 +14,7 @@ import {
 	fauxAssistantMessage,
 	type FauxProviderHandle,
 	fauxProvider,
+	getModelType,
 	getSupportedThinkingLevels,
 	type Model,
 	type MutableModels,
@@ -21,6 +22,7 @@ import {
 	type OAuthCredential,
 	type Provider,
 	type ProviderAuthInteraction,
+	type ProviderClassifier,
 	type ProviderStreams,
 } from "@earendil-works/pi-ai";
 // pi-ai's own sign-in pieces, which its package doesn't export: the loopback redirect server (Network.framework, through
@@ -37,6 +39,7 @@ import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { piMessagesApi } from "@earendil-works/pi-ai/api/pi-messages.lazy";
+import { typesafeSystemOneApi } from "@earendil-works/pi-ai/api/typesafe-system-one.lazy";
 import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
 import { followingCatalog, HostModelsStore, withRemoteCatalogs } from "./catalog.ts";
@@ -123,6 +126,7 @@ function describeModel(model: Model<string>) {
 		provider: model.provider,
 		id: model.id,
 		name: model.name,
+		type: getModelType(model),
 		api: model.api,
 		baseUrl: model.baseUrl,
 		reasoning: model.reasoning,
@@ -362,6 +366,11 @@ const apis: Record<string, () => ProviderStreams> = {
 	"pi-messages": piMessagesApi,
 };
 
+/** pi-ai's classifier API implementations a custom provider's `type: "classifier"` models can use, by `model.api`. */
+const classifierApis: Record<string, () => ProviderClassifier> = {
+	"typesafe-system-one": typesafeSystemOneApi,
+};
+
 function fauxStep(step: Args) {
 	return fauxMessage(step);
 }
@@ -420,6 +429,15 @@ register({
 			}
 		})();
 	},
+	// pi-ai `models.classify`, with a classifier model. Failures come back as a result with stop reason `error`.
+	"models.classify": (args, context: ChordContext) => {
+		const { models } = modelsState(args.id);
+		const model = models.getModelOfType("classifier", args.model.provider, args.model.modelId);
+		if (model === undefined) {
+			throw Object.assign(new Error(`Unknown classifier model ${args.model.provider}/${args.model.modelId}`), { name: "NotFound" });
+		}
+		return models.classify(model, args.context, { signal: context.abortSignal });
+	},
 
 	// With a `catalog` URL, the built-in providers get its newer catalogs, as pi does; those kept from before are
 	// restored straight away (offline), and `models.refresh` checks for newer ones.
@@ -447,9 +465,12 @@ register({
 		if (args.credential === null) await credentials.delete(args.provider);
 		else await credentials.modify(args.provider, async () => args.credential as never);
 	},
+	// Chat models, or with a `type`, the models of that type.
 	"models.list": (args) => {
 		const { models } = modelsState(args.id);
-		return models.getModels(args.provider ?? undefined).map(describeModel);
+		const provider = args.provider ?? undefined;
+		const listed = (args.type ?? "chat") === "chat" ? models.getModels(provider) : models.getModelsOfType(args.type, provider);
+		return listed.map((model) => describeModel(model as Model<string>));
 	},
 	"models.providers": (args) =>
 		modelsState(args.id)
@@ -491,16 +512,17 @@ register({
 	},
 	// pi-ai `createProvider`: `args.provider` carries its options, and `models` are pi-ai `Model` objects whose omitted
 	// fields default like models.json custom providers (provider, baseUrl, and headers inherited from the provider).
+	// Models of `type: "classifier"` use a classifier API (`classifierApis`); the others are chat models.
 	"models.addProvider": async (args) => {
 		const state = modelsState(args.id);
 		const spec = args.provider as Args;
 		const models = (spec.models as Args[]).map((model) => ({
 			name: model.id,
-			reasoning: false,
+			...(model.type === "classifier" ? {} : { reasoning: false }),
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 128000,
-			maxTokens: 16384,
+			...(model.type === "classifier" ? {} : { maxTokens: 16384 }),
 			...model,
 			api: model.api ?? spec.api,
 			provider: spec.id,
@@ -510,13 +532,21 @@ register({
 		// Serving a built-in provider's models: its catalog, pointed here, and kept current.
 		const source = typeof spec.catalog === "string" ? state.models.getProviders().find((candidate) => candidate.id === spec.catalog) : undefined;
 		const api: Record<string, ProviderStreams> = {};
+		const classifiers: Record<string, ProviderClassifier> = {};
 		const sourceModels = source ? (source.getModels() as unknown as { api: string }[]) : [];
-		for (const model of [...models, ...sourceModels]) {
+		for (const model of [...models, ...sourceModels] as { api: string; type?: string }[]) {
+			if (model.type === "classifier") {
+				const implementation = classifierApis[model.api];
+				if (implementation === undefined) throw new Error(`Unsupported classifier API "${model.api}"`);
+				classifiers[model.api] ??= implementation();
+				continue;
+			}
 			const implementation = apis[model.api];
 			if (implementation === undefined) throw new Error(`Unsupported API "${model.api}"`);
 			api[model.api] ??= implementation();
 		}
-		// Keyless servers (Ollama, LM Studio) still get a placeholder key: the SDKs refuse to send without one.
+		// Keyless servers (Ollama, LM Studio, a local classifier) still get a placeholder key: the SDKs, and pi-ai's
+		// classifier requests, refuse to send without one.
 		const keyless = spec.apiKey === undefined || spec.apiKey === null;
 		let provider = (
 				createProvider({
@@ -532,6 +562,7 @@ register({
 					},
 					models: models as never,
 					api: api as never,
+					classifiers,
 				}) as never
 		) as unknown as Provider;
 		if (source) {

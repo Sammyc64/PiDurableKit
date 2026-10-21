@@ -104,6 +104,8 @@ test("a classifier model is listed by its type; chat listings stay chat only", a
 		classifiers.map((model) => [model.id, model.type, model.api]),
 		[["clef-1", "classifier", "typesafe-system-one"]],
 	);
+	// Chat defaults don't apply to a classifier.
+	assert.deepEqual([chat[0]!.maxTokens, classifiers[0]!.maxTokens], [16384, undefined]);
 });
 
 test("models.classify answers bool, choice and score questions through System One", async () => {
