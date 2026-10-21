@@ -37,7 +37,11 @@ final class CodemodeWorkers: Sendable {
 
 /// One worker: a JavaScriptCore context confined to its own serial queue, serving one execution at a time.
 final class CodemodeWorker: @unchecked Sendable {
-    private let queue = DispatchSerialQueue(label: "PiDurableKit.Codemode", qos: .userInitiated)
+    /// Tests only (nil otherwise): runs on a worker's queue after a reply has been handed to its JavaScript, before the
+    /// reply's block ends.
+    static let afterReply = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
+
+    let queue = DispatchSerialQueue(label: "PiDurableKit.Codemode", qos: .userInitiated)
     private let log: @Sendable (Runtime.LogLevel, String) -> Void
 
     // On `queue`.
@@ -147,6 +151,7 @@ final class CodemodeWorker: @unchecked Sendable {
                 let reply = (try? await exchange(messages)) ?? #"{"type":"stop"}"#
                 self.queue.async {
                     self.worker.invokeMethod("reply", withArguments: [id, reply])
+                    CodemodeWorker.afterReply.withLock { $0 }?()
                     self.reportException()
                 }
             }

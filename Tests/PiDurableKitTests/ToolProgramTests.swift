@@ -273,6 +273,40 @@ private struct Forecast: Codable, Sendable, Equatable {
         #expect(runs.withLock { $0 } == ["before", "slow", "slow", "after"])
         try await harness.close()
     }
+
+    /// A script's last reply makes it call `done`, which lets `CodemodeWorkers.execute` release the worker (two are
+    /// already kept idle) while the block that delivered the reply is still running: the block must not then read the
+    /// released worker. In a process of its own, as reading it traps.
+    @Test func aWorkerReleasedDuringItsLastReply() async {
+        await #expect(processExitsWith: .success) {
+            try await releaseAWorkerDuringItsLastReply()
+        }
+    }
+}
+
+/// Serves one script on a worker the test owns, and releases the worker while the block that delivered the script's
+/// last reply is held after the reply (`CodemodeWorker.afterReply`).
+private func releaseAWorkerDuringItsLastReply() async throws {
+    let released = DispatchSemaphore(value: 0)
+    CodemodeWorker.afterReply.withLock { $0 = { _ = released.wait(timeout: .now() + 10) } }
+    defer { CodemodeWorker.afterReply.withLock { $0 = nil } }
+    let exchanges = OSAllocatedUnfairLock<[String]>(initialState: [])
+    var worker: CodemodeWorker? = try CodemodeWorker { _, _ in }
+    weak let observed = worker
+    let queue = try #require(worker).queue
+    let request = #"{"data":{"code":"return 1","tools":[],"globals":[],"store":{}}}"#
+    await worker?.serve(request: request, wasmPath: CodemodeOptions.quickJSPath) { messages in
+        exchanges.withLock { $0.append(messages) }
+        return "null"
+    }
+    // The script has ended: its `done` ran in the reply's block, which the hook now holds.
+    let sent = exchanges.withLock { $0 }
+    try #require(sent.count == 1 && sent[0].contains(#""type":"done""#), "The only exchange carries the result: \(sent)")
+    worker = nil
+    released.signal()
+    // Runs once the reply's block has ended (or trapped).
+    await withCheckedContinuation { continuation in queue.async { continuation.resume() } }
+    try #require(observed == nil, "The worker is released once the reply's block has ended")
 }
 
 /// Input entries, display-only writes, abandoned tasks, owned tasks, and compaction failures.
