@@ -168,6 +168,8 @@ extension MockServerTests {
         #expect(request.url.path() == "/v1/systemone")
         #expect(request.json?["model"] == .string(classifier.modelId))
 
+        // The catalog has classifiers to leave out.
+        #expect(try await models.models(for: .openAI, type: .classifier).isEmpty == false)
         try await models.register(CustomProvider(
             id: "decisions-gateway", baseURL: URL(string: "https://decisions.gateway.clef.test/v1")!, catalog: .openAI))
         #expect(try await models.models(for: "decisions-gateway").isEmpty == false)

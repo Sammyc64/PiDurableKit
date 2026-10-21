@@ -189,6 +189,7 @@ test("a provider following a built-in catalog classifies with the catalog's Syst
 test("a followed catalog leaves out the classifiers it has no classifier API for", async () => {
 	// OpenAI's classifiers use its Decisions API.
 	const id = await followCatalog("openai");
+	assert.ok(((await call("models.list", { id, provider: "openai", type: "classifier" })) as Json[]).length > 0, "the catalog has classifiers to leave out");
 	assert.ok(((await call("models.list", { id, provider: "gateway" })) as Json[]).length > 0);
 	assert.deepEqual(await call("models.list", { id, provider: "gateway", type: "classifier" }), []);
 });
