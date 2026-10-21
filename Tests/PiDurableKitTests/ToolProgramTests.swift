@@ -282,6 +282,15 @@ private struct Forecast: Codable, Sendable, Equatable {
             try await releaseAWorkerDuringItsLastReply()
         }
     }
+
+    /// A reply that arrives after its worker has been released is dropped, not delivered to the freed worker. An output
+    /// flush starts an exchange the script doesn't wait for, so the execution can end, and its worker go, while that
+    /// exchange is still waiting. In a process of its own, as delivering it traps.
+    @Test func aReplyAfterItsWorkerIsReleased() async {
+        await #expect(processExitsWith: .success) {
+            try await answerAFlushAfterItsWorkerIsReleased()
+        }
+    }
 }
 
 /// Serves one script on a worker the test owns, and releases the worker while the block that delivered the script's
@@ -310,6 +319,38 @@ private func releaseAWorkerDuringItsLastReply() async throws {
     try await eventually { observed == nil }
     try #require(observed == nil, "The worker is released once the reply's block has ended")
 }
+
+/// Serves a script whose output fills a flush (1,000 items), holds the flush's exchange until the execution has ended and
+/// the worker has been released, then answers it. The reply's task ends without a signal of its own, so the test waits
+/// for the exchange closure to be let go (`Held`).
+private func answerAFlushAfterItsWorkerIsReleased() async throws {
+    let (flushing, flushBegan) = AsyncStream<Void>.makeStream()
+    let (answer, answerFlush) = AsyncStream<Void>.makeStream()
+    var held: Held? = Held()
+    weak let exchanging = held
+    var worker: CodemodeWorker? = try CodemodeWorker { _, _ in }
+    weak let observed = worker
+    let request = #"{"data":{"code":"for (let i = 0; i < 1000; i++) console.log(i); return 1","tools":[],"globals":[],"store":{}}}"#
+    await worker?.serve(request: request, wasmPath: CodemodeOptions.quickJSPath) { [held] messages in
+        _ = held
+        if messages.contains(#""type":"done""#) { return "null" }
+        flushBegan.yield()
+        for await _ in answer {}
+        return "null"
+    }
+    held = nil
+    worker = nil
+    try await eventually { observed == nil }
+    try #require(observed == nil, "The worker is released while its flush is still waiting")
+    try await withTimeout { for await _ in flushing { break } }
+    answerFlush.finish()
+    // Gone once every task running one of the execution's exchanges has ended, the flush's included.
+    try await eventually { exchanging == nil }
+    try #require(exchanging == nil, "The flush's reply has been handled")
+}
+
+/// Captured only by an execution's exchange closure, so it goes once the worker and every exchange's task let it go.
+private final class Held: Sendable {}
 
 /// Input entries, display-only writes, abandoned tasks, owned tasks, and compaction failures.
 @Suite struct RunBehaviorTests {
