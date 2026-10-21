@@ -4,7 +4,9 @@ import Foundation
 ///
 /// Delegate callbacks run on the engine's queue, so every delivery is ordered and isolated to the engine.
 final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private unowned let engine: Engine
+    /// Weak: the session keeps its delegate until it is invalidated, so this can outlive the engine. Events for an engine
+    /// that is gone are dropped.
+    private weak var engine: Engine?
     private var session: URLSession!
     private var tasks: [Int: URLSessionDataTask] = [:]
     private var ids: [Int: Int] = [:] // task identifier → fetch id
@@ -44,7 +46,8 @@ final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     }
 
     private func fail(id: Int, message: String) {
-        engine.queue.async { [engine] in
+        guard let engine else { return }
+        engine.queue.async {
             engine.assumeIsolated { $0.deliverError(id: id, message: message) }
         }
     }
@@ -57,7 +60,7 @@ final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        guard let id = ids[dataTask.taskIdentifier] else {
+        guard let id = ids[dataTask.taskIdentifier], let engine else {
             completionHandler(.cancel)
             return
         }
@@ -77,13 +80,14 @@ final class Network: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard let id = ids[dataTask.taskIdentifier] else { return }
+        guard let id = ids[dataTask.taskIdentifier], let engine else { return }
         engine.assumeIsolated { $0.deliverData(id: id, data: data) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let id = ids.removeValue(forKey: task.taskIdentifier) else { return }
         tasks[id] = nil
+        guard let engine else { return }
         if let error {
             engine.assumeIsolated { $0.deliverError(id: id, message: error.localizedDescription) }
         } else {
