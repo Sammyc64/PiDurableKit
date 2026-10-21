@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import os
 @testable import PiDurableKit
 
 /// End-to-end requests through the real pi-ai provider implementations and their SDKs, served by `MockServer`.
@@ -324,6 +325,26 @@ extension MockServerTests {
             try receiveAResponseAfterTheEngineIsGone()
         }
     }
+
+    /// Data that arrives after the engine is gone cancels its request. The response was already allowed, and a body
+    /// that keeps streaming never goes idle long enough to time out, so it would keep downloading with nothing reading
+    /// it. No public signal says when the session has allowed a response, so the test hands the delegate the chunk
+    /// itself, on the engine's queue as the session does, for a request the server holds open.
+    @Test func dataAfterTheEngineIsGone() throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [OpenRequest.self]
+        var engine: Engine? = Engine(configuration: .init(urlSessionConfiguration: configuration))
+        weak let observed = engine
+        let network = Network(engine: try #require(engine), configuration: configuration)
+        let queue = try #require(engine).queue
+        queue.sync { network.start(id: 1, url: "https://open.test/", method: "GET", headersJSON: "[]", body: nil) }
+        try #require(OpenRequest.started.wait(timeout: .now() + 10) == .success, "The request reaches the server")
+        let task = try #require(OpenRequest.task.withLock { $0 }, "The server sees the request's task")
+        engine = nil
+        try #require(observed == nil, "The engine is gone")
+        queue.sync { network.urlSession(.shared, dataTask: task, didReceive: Data(String.sse("{}").utf8)) }
+        #expect(OpenRequest.stopped.wait(timeout: .now() + 10) == .success, "The request is cancelled")
+    }
 }
 
 /// Starts a request whose response `HeldResponse` holds, frees the engine, then lets the response arrive.
@@ -359,6 +380,25 @@ private final class HeldResponse: URLProtocol, @unchecked Sendable {
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(String.sse("{}").utf8))
+    }
+
+    override func stopLoading() {
+        Self.stopped.signal()
+    }
+}
+
+/// Holds one request open without answering it; says when the client stops loading.
+private final class OpenRequest: URLProtocol, @unchecked Sendable {
+    static let started = DispatchSemaphore(value: 0)
+    static let stopped = DispatchSemaphore(value: 0)
+    static let task = OSAllocatedUnfairLock<URLSessionDataTask?>(initialState: nil)
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.task.withLock { $0 = task as? URLSessionDataTask }
+        Self.started.signal()
     }
 
     override func stopLoading() {
