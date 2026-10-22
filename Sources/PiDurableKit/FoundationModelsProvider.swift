@@ -476,6 +476,14 @@ struct FoundationModelsResponder: Sendable {
         if case .assetsUnavailable? = error as? SystemLanguageModel.Error {
             return "Apple's on-device model assets are unavailable (service unavailable): \(detail)"
         }
+        // On battery in the background the stream throws ModelManagerServices' own rate limit, not
+        // `LanguageModelError.rateLimited`: `ModelManagerError.rateLimited` (code 1043, "Client rate limit exceeded, try
+        // again later"; undocumented, read from the framework), alone or under the guardrail backend's errors. Read it by
+        // domain and code, otherwise by the words pi-ai retries as a rate limit, so the two agree.
+        if ([error as NSError] + underlying(error)).contains(where: { $0.domain == modelManagerErrorDomain && $0.code == 1043 })
+            || detail.range(of: "rate.?limit", options: [.regularExpression, .caseInsensitive]) != nil {
+            return "Rate limit reached: \(detail)"
+        }
         // Failures without a public case arrive as an `NSError` over Apple's own `GenerativeError`, whose code is its
         // category in millions (undocumented; read from the framework): 2 a request the system cancelled, 3 a
         // network failure.
@@ -490,6 +498,7 @@ struct FoundationModelsResponder: Sendable {
     }
 
     static let generativeErrorDomain = "com.apple.GenerativeFunctionsFoundation.GenerativeError"
+    static let modelManagerErrorDomain = "ModelManagerServices.ModelManagerError"
 
     /// An error in a few words: its own description when it has one, otherwise its domain and code and those of the
     /// errors under it ("LanguageModelError -1, GenerativeError 2010000").
