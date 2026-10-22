@@ -20,6 +20,18 @@ let privateCloudComputeAvailable: Bool = {
 
 private struct City: Codable, Sendable { var city: String }
 
+/// ModelManagerServices' `ModelManagerError.rateLimited` as it bridges: its domain, code and description.
+private struct ModelManagerRateLimit: LocalizedError, CustomNSError {
+    static let errorDomain = "ModelManagerServices.ModelManagerError"
+    let errorCode = 1043
+    let errorDescription: String? = "Client rate limit exceeded, try again later"
+}
+
+/// The same description in an error of another domain.
+private struct RateLimitWords: LocalizedError {
+    let errorDescription: String? = "Client rate limit exceeded, try again later"
+}
+
 /// The Foundation Models provider against the real on-device model.
 @Suite(.enabled(if: onDeviceModelAvailable, "Needs Apple's on-device model"), .serialized)
 struct FoundationModelsTests {
@@ -264,6 +276,30 @@ struct FoundationModelsTests {
             return
         }
         #expect(text.content.contains("image omitted"))
+    }
+
+    /// On battery in the background, Foundation Models' stream throws ModelManagerServices' own rate limit
+    /// (`ModelManagerError.rateLimited`) rather than `LanguageModelError.rateLimited`, alone or under the guardrail
+    /// backend's errors. pi-ai retries its text as a rate limit, so the provider names it one too.
+    @Test func backgroundRateLimitsReadAsRateLimits() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+        #expect(FoundationModelsResponder.message(for: ModelManagerRateLimit()) == "Rate limit reached: Client rate limit exceeded, try again later")
+        // Its words alone, from an error that doesn't carry ModelManagerServices' domain and code.
+        #expect(FoundationModelsResponder.message(for: RateLimitWords()) == "Rate limit reached: Client rate limit exceeded, try again later")
+        // Under the guardrail backend, as an iPhone met it just before the typed `rateLimited`.
+        let rateLimit = NSError(domain: "ModelManagerServices.ModelManagerError", code: 1043)
+        let backend = NSError(domain: "SensitiveContentAnalysisML.CombinedTextSanitizerBackend.BackendError", code: 1, userInfo: [NSMultipleUnderlyingErrorsKey: [rateLimit]])
+        let sanitizer = NSError(domain: "com.apple.SensitiveContentAnalysisML", code: 15, userInfo: [NSMultipleUnderlyingErrorsKey: [backend]])
+        let guardrail = NSError(domain: "FoundationModels.LanguageModelError", code: -1, userInfo: [
+            NSLocalizedDescriptionKey: "The operation couldn’t be completed. (com.apple.SensitiveContentAnalysisML error 15.)",
+            NSMultipleUnderlyingErrorsKey: [sanitizer],
+        ])
+        #expect(FoundationModelsResponder.message(for: guardrail) == "Rate limit reached: LanguageModelError -1, SensitiveContentAnalysisML 15, BackendError 1, ModelManagerError 1043")
+        // The typed rate limit keeps its text, and ModelManagerServices' other errors are not rate limits.
+        let typed = LanguageModelError.rateLimited(.init(resetDate: nil, debugDescription: "slow down"))
+        #expect(FoundationModelsResponder.message(for: typed) == "Rate limit reached: \(FoundationModelsResponder.describe(typed))")
+        let deniedBySystemState = NSError(domain: "ModelManagerServices.ModelManagerError", code: 1013)
+        #expect(FoundationModelsResponder.message(for: deniedBySystemState) == "The model could not answer: ModelManagerError 1013")
     }
 
     @Test func availability() throws {
