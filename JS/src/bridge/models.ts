@@ -28,6 +28,7 @@ import {
 // pi-ai's own sign-in pieces, which its package doesn't export: the loopback redirect server (Network.framework, through
 // the node:http shim), PKCE, and the device-code poller.
 import { startOAuthCallbackServer } from "../../node_modules/@earendil-works/pi-ai/dist/auth/oauth/callback-server.js";
+import { oauthErrorSuffix } from "../shims/redact.ts";
 import { pollOAuthDeviceCodeFlow } from "../../node_modules/@earendil-works/pi-ai/dist/auth/oauth/device-code.js";
 import { generatePKCE } from "../../node_modules/@earendil-works/pi-ai/dist/auth/oauth/pkce.js";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
@@ -164,7 +165,7 @@ async function postOAuth(
 	fields: Record<string, string>,
 	format: "form" | "json",
 	signal: AbortSignal,
-): Promise<{ ok: boolean; status: number; body: Record<string, unknown>; text: string }> {
+): Promise<{ ok: boolean; status: number; body: Record<string, unknown> }> {
 	const json = format === "json";
 	const response = await fetch(url, {
 		method: "POST",
@@ -178,16 +179,17 @@ async function postOAuth(
 		const parsed = JSON.parse(text) as unknown;
 		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as Record<string, unknown>;
 	} catch {
-		// Not JSON: the text says what went wrong.
+		// Not JSON: its status says what went wrong, and its text is never passed on (Quorum M0-90b).
 	}
-	return { ok: response.ok, status: response.status, body, text };
+	return { ok: response.ok, status: response.status, body };
 }
 
-function oauthFailure(action: string, response: { status: number; body: Record<string, unknown>; text: string }): Error {
-	const error = typeof response.body.error === "string" ? response.body.error : undefined;
-	const description = typeof response.body.error_description === "string" ? response.body.error_description : undefined;
-	const detail = [error, description].filter(Boolean).join(": ") || response.text.slice(0, 300);
-	return new Error(`${action} failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
+/**
+ * A refused OAuth request, by its status and OAuth error code: never its description or body, which can quote a token or
+ * a device code (Quorum M0-90b).
+ */
+function oauthFailure(action: string, response: { status: number; body: Record<string, unknown> }): Error {
+	return new Error(`${action} failed (HTTP ${response.status})${oauthErrorSuffix(response.body.error)}`);
 }
 
 /** Tokens from a token endpoint's response; servers that don't rotate refresh tokens leave theirs out. */

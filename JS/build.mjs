@@ -124,33 +124,101 @@ const moduleReplacements = {
 };
 
 /**
- * Text changes to pi-ai modules: the other places it names itself "pi" to providers, made the app's name
- * (`clientName()` from src/shims/client.ts). Each must match exactly once, so an upstream change fails the build.
+ * Text changes to pi-ai modules. Each must match exactly once, so an upstream change fails the build. `uses` names what
+ * the change calls from src/shims (`shimExports`), imported into the module it patches.
+ * - The other places it names itself "pi" to providers, made the app's name (`clientName()` from client.ts).
+ * - Errors that quoted an OAuth response, which can hold an access token or a device code (Quorum M0-90b): they say the
+ *   status, an OAuth error code or the fields a response lacked instead, through redact.ts. A failed refresh's message
+ *   is a transcript entry, and a failed sign-in's reaches the app.
  */
 const patches = [
 	// OpenAI's sign-in page: the name the app is introduced by, when a sign-in doesn't pass one.
-	{ file: "pi-ai/dist/auth/oauth/openai-chatgpt.js", from: "options?.agentName ?? AGENT_NAME_HINT", to: "options?.agentName ?? clientName()" },
+	{ file: "pi-ai/dist/auth/oauth/openai-chatgpt.js", from: "options?.agentName ?? AGENT_NAME_HINT", to: "options?.agentName ?? clientName()", uses: "clientName" },
 	// OpenAI Codex: the originator its sign-in and requests record.
-	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: 'createAuthorizationFlow(originator = "pi")', to: "createAuthorizationFlow(originator = clientName())" },
-	{ file: "pi-ai/dist/api/openai-codex-responses.js", from: 'originator: "pi"', to: "originator: clientName()" },
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: 'createAuthorizationFlow(originator = "pi")', to: "createAuthorizationFlow(originator = clientName())", uses: "clientName" },
+	{ file: "pi-ai/dist/api/openai-codex-responses.js", from: 'originator: "pi"', to: "originator: clientName()", uses: "clientName" },
 	// xAI: the referrer its device sign-in records.
-	{ file: "pi-ai/dist/auth/oauth/xai.js", from: 'referrer: "pi"', to: "referrer: clientName()" },
+	{ file: "pi-ai/dist/auth/oauth/xai.js", from: 'referrer: "pi"', to: "referrer: clientName()", uses: "clientName" },
+	// ModelsError appends its cause's text to its message, and every OAuth refresh error, the credential store's and the auth checks' go through it: tags instead (causeTag).
+	{ file: "pi-ai/dist/utils/models-error.js", from: "    const detail = formatThrownValue(cause).trim();", to: "    const detail = causeTag(cause);", uses: "causeTag" },
+	// Anthropic: requests by their status, without the response, the URL, a cause or a stack; a response that isn't JSON by its size.
+	{ file: "pi-ai/dist/auth/oauth/anthropic.js", from: "        if (typeof error.cause !== \"undefined\") {\n            details.push(`cause=${formatErrorDetails(error.cause)}`);\n        }\n        if (error.stack) {\n            details.push(`stack=${error.stack}`);\n        }\n", to: "" },
+	{ file: "pi-ai/dist/auth/oauth/anthropic.js", from: "throw new Error(`HTTP request failed. status=${response.status}; url=${url}; body=${responseBody}`);", to: "throw new Error(`HTTP request failed (${response.status})`);" },
+	{ file: "pi-ai/dist/auth/oauth/anthropic.js", from: "`Token exchange request failed. url=${TOKEN_URL}; redirect_uri=${redirectUri}; response_type=authorization_code; details=${formatErrorDetails(error)}`", to: "`Token exchange request failed (${error instanceof Error ? error.message : \"request error\"})`" },
+	{ file: "pi-ai/dist/auth/oauth/anthropic.js", from: "`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`", to: "`Token exchange returned invalid JSON (${responseBody.length} bytes)`" },
+	{ file: "pi-ai/dist/auth/oauth/anthropic.js", from: "`Anthropic token refresh request failed. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`", to: "`Anthropic token refresh request failed (${error instanceof Error ? error.message : \"request error\"})`" },
+	{ file: "pi-ai/dist/auth/oauth/anthropic.js", from: "`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`", to: "`Anthropic token refresh returned invalid JSON (${responseBody.length} bytes)`" },
+	// OpenAI Codex: refused requests by their status; responses it rejects by the fields they lacked.
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: "`OpenAI Codex token ${operation} failed (${response.status}): ${text || response.statusText}`", to: "`OpenAI Codex token ${operation} failed (${response.status})`" },
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: "response missing fields: ${JSON.stringify(json)}", to: "response missing fields: ${invalidFields(json, { access_token: Boolean, refresh_token: Boolean, expires_in: (value) => typeof value === \"number\" })}", uses: "invalidFields" },
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: "`OpenAI Codex device code request failed with status ${response.status}${responseBody ? `: ${responseBody}` : \"\"}`", to: "`OpenAI Codex device code request failed with status ${response.status}`" },
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: "Invalid OpenAI Codex device code response: ${JSON.stringify(json)}", to: "Invalid OpenAI Codex device code response (missing or invalid: ${invalidFields(json, { device_auth_id: Boolean, user_code: Boolean, interval: () => typeof intervalSeconds === \"number\" && Number.isFinite(intervalSeconds) && intervalSeconds >= 0 })})", uses: "invalidFields" },
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: "Invalid OpenAI Codex device auth token response: ${JSON.stringify(json)}", to: "Invalid OpenAI Codex device auth token response (missing or invalid: ${invalidFields(json, { authorization_code: Boolean, code_verifier: Boolean })})", uses: "invalidFields" },
+	{ file: "pi-ai/dist/auth/oauth/openai-codex.js", from: "`OpenAI Codex device auth failed with status ${response.status}${responseBody ? `: ${responseBody}` : \"\"}`", to: "`OpenAI Codex device auth failed with status ${response.status}`" },
+	// Sign in with ChatGPT: a refused token request by its status.
+	{ file: "pi-ai/dist/auth/oauth/openai-chatgpt.js", from: "`OpenAI OAuth token request failed (${response.status}): ${responseBody || response.statusText}`", to: "`OpenAI OAuth token request failed (${response.status})`" },
+	// Kimi Code: refused requests by their status and OAuth error code; responses it rejects by the fields they lacked.
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "`Kimi Code token refresh unauthorized (status ${response.status})${description}`", to: "`Kimi Code token refresh unauthorized (status ${response.status})${oauthErrorSuffix(json?.error)}`", uses: "oauthErrorSuffix" },
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "`Kimi Code token refresh failed with status ${response.status}${text ? `: ${text}` : \"\"}`", to: "`Kimi Code token refresh failed with status ${response.status}`" },
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "response missing fields: ${JSON.stringify(json)}", to: "response missing fields: ${invalidFields(json, { access_token: (value) => typeof value === \"string\" && value !== \"\", refresh_token: (value) => typeof value === \"string\" && value !== \"\", expires_in: (value) => typeof value === \"number\" && Number.isFinite(value) && value > 0 })}", uses: "invalidFields" },
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "`Kimi Code device authorization failed with status ${response.status}${text ? `: ${text}` : \"\"}`", to: "`Kimi Code device authorization failed with status ${response.status}`" },
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "Invalid Kimi Code device authorization response: ${JSON.stringify(json)}", to: "Invalid Kimi Code device authorization response (missing or invalid: ${invalidFields(json, { device_code: (value) => typeof value === \"string\", user_code: (value) => typeof value === \"string\", verification_uri: (value) => typeof value === \"string\" && Boolean(trustedHttpUrl(value)), verification_uri_complete: (value) => typeof value === \"string\" && Boolean(trustedHttpUrl(value)) })})", uses: "invalidFields" },
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "`Kimi Code device token request failed with status ${response.status}${text ? `: ${text}` : \"\"}`", to: "`Kimi Code device token request failed with status ${response.status}`" },
+	{ file: "pi-ai/dist/auth/oauth/kimi-coding.js", from: "`Kimi Code device token request failed (status ${response.status})${typeof error === \"string\" ? `: ${error}${description}` : \"\"}`", to: "`Kimi Code device token request failed (status ${response.status})${oauthErrorSuffix(error)}`", uses: "oauthErrorSuffix" },
+	// GitHub Copilot: refused requests by their status (its status text is the server's too), and a failed device sign-in by its OAuth error code.
+	{ file: "pi-ai/dist/auth/oauth/github-copilot.js", from: "        const text = await response.text();\n        throw new Error(`${response.status} ${response.statusText}: ${text}`);", to: "        throw new Error(`GitHub request failed (${response.status})`);" },
+	{ file: "pi-ai/dist/auth/oauth/github-copilot.js", from: "throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);\n    }\n    return parseGitHubCopilotModelCatalog", to: "throw new Error(`Copilot models request failed (${response.status})`);\n    }\n    return parseGitHubCopilotModelCatalog" },
+	{ file: "pi-ai/dist/auth/oauth/github-copilot.js", from: "message: `Device flow failed: ${error}${descriptionSuffix}`", to: "message: `Device flow failed${oauthErrorSuffix(error)}`", uses: "oauthErrorSuffix" },
+	// Meta: an error's OAuth code only, and a device authorization it rejects by the fields it lacked.
+	{ file: "pi-ai/dist/auth/oauth/meta.js", from: "    for (const key of [\"error_description\", \"detail\", \"message\", \"error\"]) {\n        const value = json?.[key];\n        if (typeof value === \"string\" && value.trim())\n            return `: ${value.trim()}`;\n    }\n    return \"\";", to: "    return oauthErrorSuffix(json?.error);", uses: "oauthErrorSuffix" },
+	{ file: "pi-ai/dist/auth/oauth/meta.js", from: "Invalid Meta device authorization response: ${JSON.stringify(json)}", to: "Invalid Meta device authorization response (missing or invalid: ${invalidFields(json, { device_code: (value) => typeof value === \"string\" && value !== \"\", user_code: (value) => typeof value === \"string\" && value !== \"\", verification_uri: () => Boolean(verificationUri) })})", uses: "invalidFields" },
+	// xAI: a refused request's OAuth code only, not its description.
+	{ file: "pi-ai/dist/auth/oauth/xai.js", from: "const detail = [error, description].filter(Boolean).join(\": \");", to: "const detail = oauthErrorCode(error) ?? \"\";", uses: "oauthErrorCode" },
+	// Radius: a refused request by its status and OAuth code; its gateway's config by its status.
+	{ file: "pi-ai/dist/auth/oauth/radius.js", from: "super(`${message}: ${detail}`);", to: "super(`${message} (${status})${oauthErrorSuffix(oauthError)}`);", uses: "oauthErrorSuffix" },
+	{ file: "pi-ai/dist/auth/oauth/radius.js", from: "`Could not load Radius OAuth config from ${gateway}: ${response.status} ${await response.text()}`", to: "`Could not load Radius OAuth config (${response.status})`" },
+	// OpenRouter: a refused key exchange by its status.
+	{ file: "pi-ai/dist/auth/oauth/openrouter.js", from: "`OpenRouter OAuth key exchange failed (HTTP ${response.status})${detail ? `: ${detail}` : \"\"}`", to: "`OpenRouter OAuth key exchange failed (HTTP ${response.status})`" },
+	// A provider error's diagnostic, which the transcript keeps, without its stack: one holds the bundle's path, a user's home folder on a Mac.
+	{ file: "pi-ai/dist/utils/diagnostics.js", from: "        stack: error.stack,\n", to: "" },
+	// Meta: a key it didn't issue, without the setup link its response gave.
+	{ file: "pi-ai/dist/auth/oauth/meta.js", from: "`Meta did not issue an API key.${actionUrl ? ` Complete setup at ${actionUrl}` : \"\"}`", to: "\"Meta did not issue an API key\"" },
+	// A sign-in page that returned an error: its OAuth code at most, never its description (the page itself still shows it).
+	{ file: "pi-ai/dist/auth/oauth/callback-server.js", from: "finish({ error: new Error(`${providerName} authorization failed: ${description}`) });", to: "finish({ error: new Error(`${providerName} authorization failed${oauthErrorSuffix(error)}`) });", uses: "oauthErrorSuffix" },
+	// Sign in with ChatGPT: a returned error by its OAuth code at most.
+	{ file: "pi-ai/dist/auth/oauth/openai-chatgpt.js", from: "        throw new Error(`ChatGPT authorization failed: ${error}`);", to: "        throw new Error(`ChatGPT authorization failed${oauthErrorSuffix(error)}`);", uses: "oauthErrorSuffix" },
+	{ file: "pi-ai/dist/auth/oauth/openai-chatgpt.js", from: "rejectResult(new Error(`ChatGPT authorization failed: ${error}`));", to: "rejectResult(new Error(`ChatGPT authorization failed${oauthErrorSuffix(error)}`));", uses: "oauthErrorSuffix" },
+	// GitHub Copilot: a rate-limited policy request by its status.
+	{ file: "pi-ai/dist/auth/oauth/github-copilot.js", from: "    if (response.status === 429) {\n        throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);", to: "    if (response.status === 429) {\n        throw new Error(`Copilot request failed (${response.status})`);" },
 ];
+const shimExports = {
+	clientName: "src/shims/client.ts",
+	causeTag: "src/shims/redact.ts",
+	invalidFields: "src/shims/redact.ts",
+	oauthErrorCode: "src/shims/redact.ts",
+	oauthErrorSuffix: "src/shims/redact.ts",
+};
 const patched = new Set();
 
 const modulePatches = {
 	name: "pi-durable-kit-patches",
 	setup(build) {
-		build.onLoad({ filter: /pi-ai\/dist\/(auth\/oauth\/(openai-chatgpt|openai-codex|xai)|api\/openai-codex-responses)\.js$/ }, (args) => {
+		const modules = /pi-ai\/dist\/(auth\/oauth\/(anthropic|callback-server|github-copilot|kimi-coding|meta|openai-chatgpt|openai-codex|openrouter|radius|xai)|utils\/(models-error|diagnostics)|api\/openai-codex-responses)\.js$/;
+		build.onLoad({ filter: modules }, (args) => {
 			let contents = readFileSync(args.path, "utf8");
+			const uses = new Set();
 			for (const patch of patches.filter((candidate) => args.path.endsWith(candidate.file))) {
 				const count = contents.split(patch.from).length - 1;
 				if (count !== 1) throw new Error(`${patch.file}: expected "${patch.from}" once, found it ${count} times; update the patches`);
-				contents = contents.replace(patch.from, patch.to);
+				// A function, so a `$` in the new text is literal.
+				contents = contents.replace(patch.from, () => patch.to);
 				patched.add(patch);
+				if (patch.uses !== undefined) uses.add(patch.uses);
 			}
-			const client = JSON.stringify(resolve(root, "src/shims/client.ts"));
-			return { contents: `import { clientName } from ${client};\n${contents}`, loader: "js", resolveDir: dirname(args.path) };
+			const imports = Object.entries(Object.groupBy([...uses].sort(), (name) => shimExports[name]))
+				.map(([file, names]) => `import { ${names.join(", ")} } from ${JSON.stringify(resolve(root, file))};\n`)
+				.join("");
+			return { contents: `${imports}${contents}`, loader: "js", resolveDir: dirname(args.path) };
 		});
 	},
 };

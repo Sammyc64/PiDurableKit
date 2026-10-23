@@ -25,14 +25,16 @@ export function serializeError(error: unknown): Json {
 		return {
 			name: error.name,
 			message: error.message,
-			stack: error.stack ?? null,
+			// No stack: one holds the bundle's path, a user's home folder on a Mac (Quorum M0-90b), and Swift reads none.
+			stack: null,
 			code: ((error as { code?: unknown }).code as Json) ?? null,
 			// The fields pi-durable's error classes carry: `ConversationBusy`, `FileError`, `ExecutionError`.
 			conversationId: ((error as { conversationId?: unknown }).conversationId as Json) ?? null,
 			path: ((error as { path?: unknown }).path as Json) ?? null,
 			spillPath: ((error as { spillPath?: unknown }).spillPath as Json) ?? null,
-			// `SessionFailed` carries the storage error that failed the Session.
-			cause: error.cause === undefined ? null : serializeError(error.cause),
+			// `SessionFailed` carries the storage error that failed the Session, the one cause Swift reads. Any other's is
+			// left out: pi-ai's can quote a provider's response (Quorum M0-90b).
+			cause: error.name === "SessionFailed" && error.cause !== undefined ? serializeError(error.cause) : null,
 		};
 	}
 	return { name: "Error", message: messageOf(error), stack: null, code: null };

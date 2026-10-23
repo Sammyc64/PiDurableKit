@@ -164,7 +164,13 @@ abstract class Body {
 		return new TextDecoder().decode(await this.consume());
 	}
 	async json(): Promise<unknown> {
-		return JSON.parse(await this.text());
+		const text = await this.text();
+		try {
+			return JSON.parse(text);
+		} catch {
+			// JavaScriptCore's parse error quotes the text it stopped at, which can be a token (Quorum M0-90b).
+			throw new SyntaxError("The response isn't valid JSON");
+		}
 	}
 }
 

@@ -29,7 +29,8 @@ public enum PiDurableError: Error, Sendable, LocalizedError, CustomStringConvert
     case notFound(String)
     /// A wait or operation was cancelled.
     case cancelled
-    /// Any other JavaScript error thrown by pi-durable or pi-ai, with its `code` property if it has one.
+    /// Any other JavaScript error thrown by pi-durable or pi-ai, with its `code` property if it has one. `stack` is
+    /// always `nil`: the bridge passes none, since a stack holds the bundle's path, a user's home folder on a Mac.
     case javaScript(name: String, message: String, stack: String?, code: String?)
     /// The JavaScript runtime could not be started.
     case runtime(String)
