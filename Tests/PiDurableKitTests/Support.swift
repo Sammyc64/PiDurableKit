@@ -41,6 +41,8 @@ final class MockServer: URLProtocol, @unchecked Sendable {
         var status = 200
         var headers = ["content-type": "text/event-stream"]
         var chunks: [String]
+        /// Fails the request at the transport instead, as a dropped connection does.
+        var failure: URLError.Code?
     }
 
     struct Request: Sendable {
@@ -96,6 +98,10 @@ final class MockServer: URLProtocol, @unchecked Sendable {
             return Self.handlers[request.url!.host() ?? ""]
         }
         let response = handler?(recorded) ?? Response(status: 404, headers: [:], chunks: ["not found"])
+        if let failure = response.failure {
+            client?.urlProtocol(self, didFailWithError: URLError(failure))
+            return
+        }
         let http = HTTPURLResponse(url: request.url!, statusCode: response.status, httpVersion: "HTTP/1.1", headerFields: response.headers)!
         client?.urlProtocol(self, didReceive: http, cacheStoragePolicy: .notAllowed)
         let client = client
